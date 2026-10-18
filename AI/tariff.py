@@ -116,12 +116,39 @@ class WeaviateRetriever:
     def load_country_map(url="https://bapi.logistx.us/his_countries"):
         with urlopen(url, timeout=20) as response:
             data = json.load(response)
+        if not isinstance(data, dict) or not isinstance(data.get("countries"), list):
+            raise ValueError("Country API response must contain a countries array")
         mapping = {}
-        for row in data.get("countries", []):
-            iso = iso2_from_country(row.get("country_name"))
+        choices = {}
+        for row in data["countries"]:
+            if not isinstance(row, dict) or row.get("isactive") is False:
+                continue
+            name = row.get("country_name")
+            if not isinstance(name, str):
+                continue
+            # API labels include an ISO suffix and optional trade-bloc labels,
+            # e.g. "Finland - FI (EU)". Only validated ISO codes are accepted.
+            label = re.fullmatch(r"(.+?)\s+-\s+([A-Za-z]{2})(?:\s*\([^()]*\))*\s*", name.strip())
+            base_iso = iso2_from_country(label[1].strip() if label else name)
+            iso = iso2_from_country(label[2]) if label else base_iso
+            if base_iso and iso and base_iso != iso:
+                continue
             code = row.get("country_code")
-            if iso and code is not None:
-                mapping[iso] = str(code)
+            if not iso or isinstance(code, bool) or not isinstance(code, (str, int)):
+                continue
+            code = str(code).strip()
+            if not code:
+                continue
+            # Standard entries ("Israel - IL") take precedence over alternate
+            # schedules ("Israel (11 digits) - IL"), regardless of API order.
+            priority = 2 if base_iso == iso else 1
+            choices.setdefault(iso, []).append((priority, code))
+        for iso, candidates in choices.items():
+            best = max(priority for priority, _ in candidates)
+            codes = {code for priority, code in candidates if priority == best}
+            if len(codes) != 1:
+                raise ValueError(f"Country API has ambiguous database IDs for {iso}")
+            mapping[iso] = codes.pop()
         if not mapping:
             raise ValueError("Country API returned no usable ISO-to-database mappings")
         return mapping

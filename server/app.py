@@ -15,6 +15,8 @@ from server.api.websocket import router as websocket_router
 from server.api.invoice_websocket import router as invoice_websocket_router
 from server.routes.models import router as models_router
 from server.routes.invoices import router as invoices_router
+from server.routes.gpu import router as gpu_router
+from server.api.gpu_websocket import router as gpu_websocket_router
 
 
 def create_app() -> FastAPI:
@@ -22,8 +24,10 @@ def create_app() -> FastAPI:
     app.include_router(rest_router, prefix="/api/v1")
     app.include_router(models_router, prefix="/api/v1")
     app.include_router(invoices_router, prefix="/api/v1")
+    app.include_router(gpu_router, prefix="/api/v1")
     app.include_router(websocket_router, prefix="/ws")
     app.include_router(invoice_websocket_router, prefix="/ws")
+    app.include_router(gpu_websocket_router, prefix="/ws")
     return app
 
 

@@ -30,10 +30,24 @@ class InvoiceProcessor:
             raise RuntimeError("INVOICE_MAX_UPLOAD_BYTES must be positive")
         return max_bytes
 
+    def save_upload(self, stream: BinaryIO, filename: str | None, destination: Path) -> None:
+        """Stage and validate a PDF before either synchronous or queued processing."""
+        self.validate_filename(filename)
+        max_bytes = self.upload_limit()
+        total = 0
+        with destination.open("wb") as output:
+            while chunk := stream.read(1024 * 1024):
+                total += len(chunk)
+                if total > max_bytes:
+                    raise InvoiceTooLargeError(f"Invoice PDF exceeds the {max_bytes}-byte upload limit")
+                output.write(chunk)
+        if total == 0:
+            raise InvalidInvoiceError("The uploaded PDF is empty")
+        self._validate_pdf(destination)
+
     def process(self, stream: BinaryIO, filename: str | None,
                 progress: Callable[[str], None] | None = None) -> dict[str, Any]:
         self.validate_filename(filename)
-        max_bytes = self.upload_limit()
         backend = os.getenv("INVOICE_TARIFF_BACKEND", "weaviate")
         if backend not in {"catalog", "weaviate"}:
             raise RuntimeError("INVOICE_TARIFF_BACKEND must be catalog or weaviate")
@@ -42,16 +56,7 @@ class InvoiceProcessor:
         # request owns its PDF and intermediate artifacts until its response.
         with TemporaryDirectory(prefix="invoice_upload_") as folder:
             pdf = Path(folder) / "invoice.pdf"
-            total = 0
-            with pdf.open("wb") as destination:
-                while chunk := stream.read(1024 * 1024):
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise InvoiceTooLargeError(f"Invoice PDF exceeds the {max_bytes}-byte upload limit")
-                    destination.write(chunk)
-            if total == 0:
-                raise InvalidInvoiceError("The uploaded PDF is empty")
-            self._validate_pdf(pdf)
+            self.save_upload(stream, filename, pdf)
 
             # Lazy import: server startup and rejected uploads load no AI models.
             from AI.main import doc_pipeline

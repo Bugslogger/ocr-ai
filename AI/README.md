@@ -67,6 +67,8 @@ python -m pip install -r AI/requirements.txt
 
 For the API server, also install `server/requirements.txt`. Keep the full pipeline in one worker process per GPU unless you have provisioned memory for multiple copies of both models.
 
+The requirements pin PyTorch 2.10.0 and torchvision 0.25.0 together. On the A100 host, install their CUDA 12.8 builds before the requirements with `python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128`. Use the same interpreter for package installation and server startup; see the exact `/workspace/server/venv/bin/python` commands in [`server/README.md`](../server/README.md).
+
 Model defaults are `baidu/Unlimited-OCR` and `Qwen/Qwen2.5-7B-Instruct`. Hugging Face uses its normal cache and `HF_TOKEN` environment variable. Set `OCR_MODEL_REVISION` and `QWEN_MODEL_REVISION` to commit hashes when reproducible model code and weights are required. Unlimited-OCR loads custom model code with `trust_remote_code=True`.
 
 The adapter uses the text returned by [`infer_multi()`](https://huggingface.co/baidu/Unlimited-OCR/blob/main/modeling_unlimitedocr.py). It passes `save_results=False` to avoid the model's markdown postprocessor discarding text without page markers. The expected return is a string or a tuple whose first element is text; unsupported returns fail explicitly.
@@ -147,7 +149,7 @@ Configure the connection using environment variables:
 
 The database connection does not require an API key and sends no authentication credentials.
 
-The `Hs_category` collection must expose `country_code`, `code`, `description`, and `indent` properties. `country_code` is queried as a string. Country database IDs are mapped from `https://bapi.logistx.us/his_countries` using exact country resolution. An unavailable API fails the run; an unmapped country produces no candidates for that role.
+The `Hs_category` collection must expose `country_code`, `code`, `description`, and `indent` properties. `country_code` is queried as a string. Country database IDs are mapped from `https://bapi.logistx.us/his_countries`. API labels such as `Finland - FI (EU)` are parsed using their validated ISO suffix. Standard country entries take precedence over alternate schedules such as `Israel (11 digits) - IL`, regardless of API order. Inactive and invalid entries are skipped; conflicting standard IDs fail explicitly. An unavailable API fails the run; an unmapped country produces no candidates for that role.
 
 BM25 retrieves at most 25 rows per distinct origin/destination country. Six-digit rows provide international candidates; longer numeric rows also provide national candidates. Origin and destination can share the same lookup when the countries match. Search relevance is not used to fabricate a parent-child tree. This backend's candidate coverage depends on database contents and the search limit.
 
@@ -188,9 +190,13 @@ Review flags take priority over confidence. A result requiring review cannot ret
 
 ## Server integration
 
+For long requests behind Cloudflare, use `POST /api/v1/invoices/jobs` to upload the PDF and receive a job ID immediately after validation. Poll `GET /api/v1/invoices/jobs/{job_id}` for progress and the final JSON in `result`. Completed job results are persisted under `INVOICE_JOB_DIR`; active jobs interrupted by a server restart must be submitted again.
+
 The FastAPI service exposes `POST /api/v1/invoices/extract`: upload an invoice PDF in multipart field `file` to run `doc_pipeline()` and receive the complete invoice JSON in the same HTTP response. The upload endpoint defaults to the Weaviate backend at the configured host without an API key; set `INVOICE_TARIFF_BACKEND=catalog` to use the catalog instead. Uploaded files and temporary pipeline artifacts are removed after processing.
 
 The WebSocket endpoint `/ws/invoices/extract` accepts JSON filename/size metadata followed by binary PDF chunks. It runs the same processor and sends progress events followed by a `completed` event whose `result` contains the invoice JSON. See the server guide for the message protocol and client example.
+
+Call `POST /api/v1/models/download` without a body to download and store both model repositories before processing invoices. It returns cache snapshot paths and revisions without importing Torch or loading model objects. The inference loaders use the same cache directory. `GET /api/v1/models/status` checks cached weights, including all shards in a weight index.
 
 The existing path-based `/api/v1/jobs` endpoints remain OCR-only. Their processor imports `AI.model` and `AI.utils`, loads only OCR, and returns raw and cleaned text paths. Their REST/WebSocket contract is unchanged. See [`server/README.md`](../server/README.md) for upload examples, API flow, configuration, error codes, and startup commands.
 

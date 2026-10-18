@@ -1,5 +1,6 @@
 """Regression tests using tiny local PDFs and fake model/database responses."""
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace, ModuleType
@@ -40,6 +41,59 @@ def make_pdf(path):
             page = document.new_page(width=72, height=72)
             page.insert_text((5, 20), "Invoice", fontsize=8)
         document.save(path)
+
+
+class CountryMapTests(TestCase):
+    def load(self, payload):
+        with patch("AI.tariff.urlopen", return_value=BytesIO(json.dumps(payload).encode())):
+            return WeaviateRetriever.load_country_map()
+
+    def test_api_iso_suffixes_and_trade_bloc_annotations(self):
+        mapping = self.load({"statuscode": 1, "countries": [
+            {"country_name": "Afghanistan - AF", "country_code": "2"},
+            {"country_name": "Finland - FI (EU)", "country_code": "74"},
+            {"country_name": "Benin - BJ (UEMOA)", "country_code": "24"},
+            {"country_name": "United States - US", "country_code": 1},
+            {"country_name": "Australia", "country_code": "14"},
+        ]})
+        self.assertEqual(mapping, {"AF": "2", "FI": "74", "BJ": "24", "US": "1", "AU": "14"})
+
+    def test_standard_schedule_wins_regardless_of_row_order(self):
+        rows = [
+            {"country_name": "Swiss 11 digits - CH", "country_code": "2208"},
+            {"country_name": "Swiss 8 digits - CH", "country_code": "2207"},
+            {"country_name": "Switzerland - CH", "country_code": "207"},
+            {"country_name": "Israel - IL", "country_code": "107"},
+            {"country_name": "Israel (11 digits) - IL", "country_code": "1107"},
+        ]
+        for ordered in [rows, list(reversed(rows))]:
+            self.assertEqual(self.load({"countries": ordered}), {"CH": "207", "IL": "107"})
+
+    def test_ambiguous_standard_schedules_fail_explicitly(self):
+        with self.assertRaisesRegex(ValueError, "ambiguous database IDs for FI"):
+            self.load({"countries": [
+                {"country_name": "Finland - FI (EU)", "country_code": "74"},
+                {"country_name": "Finland - FI", "country_code": "999"},
+            ]})
+
+    def test_invalid_inactive_and_mismatched_rows_are_ignored(self):
+        mapping = self.load({"countries": [
+            None, "invalid", {},
+            {"country_name": "Finland - FI", "country_code": "74", "isactive": False},
+            {"country_name": "Finland - AU", "country_code": "wrong"},
+            {"country_name": "Invalid - ZZ", "country_code": "999"},
+            {"country_name": "Finland - FI", "country_code": True},
+            {"country_name": "Finland - FI", "country_code": " "},
+            {"country_name": "Australia - AU", "country_code": "14"},
+        ]})
+        self.assertEqual(mapping, {"AU": "14"})
+
+    def test_empty_or_invalid_api_shape_reports_clear_error(self):
+        for payload in [[], {}, {"countries": None}]:
+            with self.subTest(payload=payload), self.assertRaisesRegex(ValueError, "countries array"):
+                self.load(payload)
+        with self.assertRaisesRegex(ValueError, "no usable ISO-to-database mappings"):
+            self.load({"countries": []})
 
 
 class TariffTests(TestCase):

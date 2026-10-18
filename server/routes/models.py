@@ -1,26 +1,21 @@
-"""Read-only model-cache inspection endpoints."""
+"""Model repository downloads and read-only cache inspection."""
 from pathlib import Path
-import os
+import json
+import logging
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
-from server.schemas import ModelStatus, ModelsStatusResponse
+from server.schemas import ModelStatus, ModelsStatusResponse, ModelDownloadResponse
+from AI.model import MODEL_DEFAULTS, model_spec, model_cache_dir
 
 router = APIRouter(prefix="/models", tags=["Models"])
 
 AI_ROOT = Path(__file__).resolve().parents[2] / "AI"
-MODEL_SPECS = (
-    ("baidu/Unlimited-OCR", "models--baidu--Unlimited-OCR", "Unlimited-OCR"),
-    ("Qwen/Qwen2.5-7B-Instruct", "models--Qwen--Qwen2.5-7B-Instruct", "Qwen2.5-7B-Instruct"),
-)
+logger = logging.getLogger(__name__)
 
 
 def _huggingface_hub_dir() -> Path:
-    configured_cache = os.getenv("HF_HUB_CACHE") or os.getenv("HUGGINGFACE_HUB_CACHE")
-    if configured_cache:
-        return Path(configured_cache).expanduser()
-    hf_home = Path(os.getenv("HF_HOME", "~/.cache/huggingface")).expanduser()
-    return hf_home / "hub"
+    return model_cache_dir()
 
 
 def _candidate_locations(cache_name: str, repository_name: str) -> list[Path]:
@@ -39,15 +34,39 @@ def _snapshot_dirs(location: Path) -> list[Path]:
 
 
 def _is_downloaded(snapshot: Path) -> bool:
-    has_config = (snapshot / "config.json").is_file()
-    has_weights = any(snapshot.glob("*.safetensors")) or any(snapshot.glob("pytorch_model*.bin"))
-    return has_config and has_weights
+    if not (snapshot / "config.json").is_file():
+        return False
+    for filename in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index = snapshot / filename
+        if index.is_file():
+            try:
+                shards = set(json.loads(index.read_text(encoding="utf-8"))["weight_map"].values())
+                return bool(shards) and all((snapshot / shard).is_file() for shard in shards)
+            except (ValueError, KeyError, TypeError, AttributeError, OSError):
+                return False
+    return (snapshot / "model.safetensors").is_file() or (snapshot / "pytorch_model.bin").is_file()
+
+
+@router.post("/download", response_model=ModelDownloadResponse,
+             summary="Download both model repositories to disk without loading models",
+             responses={502: {"description": "Model repository download failed"}})
+def download_models() -> ModelDownloadResponse:
+    from AI.model import download_model_files
+
+    try:
+        return ModelDownloadResponse(models=download_model_files())
+    except Exception as exc:
+        logger.exception("Model repository download failed")
+        raise HTTPException(status_code=502, detail="Model download failed. Check the server logs for details.") from exc
 
 
 @router.get("/status", response_model=ModelsStatusResponse)
 async def model_status() -> ModelsStatusResponse:
     statuses: list[ModelStatus] = []
-    for model_id, cache_name, repository_name in MODEL_SPECS:
+    for kind in MODEL_DEFAULTS:
+        model_id, _ = model_spec(kind)
+        cache_name = "models--" + model_id.replace("/", "--")
+        repository_name = model_id.rsplit("/", 1)[-1]
         locations = _candidate_locations(cache_name, repository_name)
         downloaded_path = next(
             (snapshot for location in locations for snapshot in _snapshot_dirs(location) if _is_downloaded(snapshot)),
