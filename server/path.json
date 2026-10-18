@@ -1,0 +1,29 @@
+{
+    "all_downloaded": false,
+    "models": [
+        {
+            "model_id": "baidu/Unlimited-OCR",
+            "downloaded": false,
+            "location": null,
+            "locations_checked": [
+                "/workspace/AI/models/models--baidu--Unlimited-OCR",
+                "/workspace/AI/model_cache/models--baidu--Unlimited-OCR",
+                "/workspace/AI/huggingface/hub/models--baidu--Unlimited-OCR",
+                "/workspace/AI/models/Unlimited-OCR",
+                "/workspace/.cache/huggingface/hub/models--baidu--Unlimited-OCR"
+            ]
+        },
+        {
+            "model_id": "Qwen/Qwen2.5-7B-Instruct",
+            "downloaded": false,
+            "location": null,
+            "locations_checked": [
+                "/workspace/AI/models/models--Qwen--Qwen2.5-7B-Instruct",
+                "/workspace/AI/model_cache/models--Qwen--Qwen2.5-7B-Instruct",
+                "/workspace/AI/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct",
+                "/workspace/AI/models/Qwen2.5-7B-Instruct",
+                "/workspace/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct"
+            ]
+        }
+    ]
+}
