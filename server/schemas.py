@@ -71,6 +71,10 @@ class InvoiceJobResponse(BaseModel):
     job_id: str
     status: JobStatus
     stage: str
+    stage_description: str = ""
+    progress_percent: int = Field(default=0, ge=0, le=100)
+    progress_is_estimate: bool = True
+    queue_position: int | None = Field(default=None, ge=0, description="1 = next waiting job, 0 = processing, null = terminal or unknown")
     filename: str
     created_at: datetime
     updated_at: datetime

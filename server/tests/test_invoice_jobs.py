@@ -26,6 +26,9 @@ class InvoiceJobTests(TestCase):
         self.route_patch = patch("server.routes.invoices.invoice_jobs", self.service)
         self.route_patch.start()
         self.addCleanup(self.route_patch.stop)
+        socket_patch = patch("server.api.invoice_job_websocket.invoice_jobs", self.service)
+        socket_patch.start()
+        self.addCleanup(socket_patch.stop)
         self.client = TestClient(create_app())
         self.addCleanup(self.client.close)
 
@@ -65,12 +68,16 @@ class InvoiceJobTests(TestCase):
                 self.assertEqual(progress.status_code, 200)
                 self.assertEqual(progress.json()["status"], "processing")
                 self.assertEqual(progress.json()["stage"], "running_ocr")
+                self.assertEqual(progress.json()["progress_percent"], 20)
+                self.assertEqual(progress.json()["queue_position"], 0)
                 self.assertIsNone(progress.json()["result"])
                 self.assertEqual(progress.headers["cache-control"], "no-store")
             finally:
                 release.set()
             final = self.terminal(job_id)
         self.assertEqual(final.status, JobStatus.SUCCEEDED)
+        self.assertEqual(final.progress_percent, 100)
+        self.assertIsNone(final.queue_position)
         self.assertEqual(final.result.model_dump(), expected)
         self.assertFalse((Path(self.directory.name)/job_id/"invoice.pdf").exists())
         # Completed results remain available after recreating the registry.
@@ -152,11 +159,129 @@ class InvoiceJobTests(TestCase):
                 self.assertEqual(response.status_code, 202)
                 second = response.json()["job_id"]
                 self.assertEqual(self.service.get(second).status, JobStatus.QUEUED)
+                self.assertEqual(self.service.get(second).queue_position, 1)
+                third = self.submit().json()["job_id"]
+                self.assertEqual(self.service.get(third).queue_position, 2)
                 self.assertEqual(len(calls), 1)
             finally:
                 release.set()
             self.assertEqual(self.terminal(first).status, JobStatus.SUCCEEDED)
             self.assertEqual(self.terminal(second).status, JobStatus.SUCCEEDED)
+            self.assertEqual(self.terminal(third).status, JobStatus.SUCCEEDED)
+
+    def test_job_socket_streams_progress_and_persisted_result_on_reconnect(self):
+        started, release = Event(), Event()
+
+        def pipeline(*args, **options):
+            options["progress"]("extracting_json")
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("Test did not release inference")
+            return extracted_result()
+
+        with patch("AI.main.doc_pipeline", side_effect=pipeline):
+            job_id = self.submit().json()["job_id"]
+            try:
+                self.assertTrue(started.wait(2))
+                with self.client.websocket_connect(f"/ws/invoices/jobs/{job_id}") as socket:
+                    message = socket.receive_json()
+                    self.assertEqual(message["event"], "progress")
+                    self.assertEqual(message["job"]["job_id"], job_id)
+                    self.assertEqual(message["job"]["progress_percent"], 55)
+                    self.assertTrue(message["job"]["progress_is_estimate"])
+                    self.assertIn("structured", message["job"]["stage_description"])
+                    release.set()
+                    self.terminal(job_id)
+                    message = socket.receive_json()
+                    self.assertEqual(message["event"], "completed")
+                    self.assertEqual(message["job"]["result"], extracted_result())
+            finally:
+                release.set()
+                self.terminal(job_id)
+        with self.client.websocket_connect(f"/ws/invoices/jobs/{job_id}") as socket:
+            message = socket.receive_json()
+            self.assertEqual(message["event"], "completed")
+            self.assertEqual(message["job"]["progress_percent"], 100)
+
+    def test_socket_disconnect_leaves_job_running_and_can_reconnect(self):
+        started, release = Event(), Event()
+
+        def pipeline(*args, **options):
+            options["progress"]("running_ocr")
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("Test did not release inference")
+            return extracted_result()
+
+        with patch("AI.main.doc_pipeline", side_effect=pipeline):
+            job_id = self.submit().json()["job_id"]
+            try:
+                self.assertTrue(started.wait(2))
+                with self.client.websocket_connect(f"/ws/invoices/jobs/{job_id}") as socket:
+                    self.assertEqual(socket.receive_json()["event"], "progress")
+                self.assertEqual(self.service.get(job_id).status, JobStatus.PROCESSING)
+                with self.client.websocket_connect(f"/ws/invoices/jobs/{job_id}") as socket:
+                    socket.receive_json()
+                    socket.send_text("unexpected")
+                    self.assertEqual(socket.receive_json()["event"], "error")
+                self.assertEqual(self.service.get(job_id).status, JobStatus.PROCESSING)
+            finally:
+                release.set()
+                self.terminal(job_id)
+
+    def test_socket_unknown_job_and_failed_job(self):
+        with self.client.websocket_connect("/ws/invoices/jobs/not-an-id") as socket:
+            message = socket.receive_json()
+            self.assertEqual(message["status"], 404)
+        with patch("AI.main.doc_pipeline", side_effect=RuntimeError("private details")), self.assertLogs(
+            "server.services.invoice_jobs", level="ERROR"
+        ):
+            job_id = self.submit().json()["job_id"]
+            self.terminal(job_id)
+        with self.client.websocket_connect(f"/ws/invoices/jobs/{job_id}") as socket:
+            message = socket.receive_json()
+            self.assertEqual(message["event"], "failed")
+            self.assertNotIn("private details", message["job"]["error"])
+            self.assertLess(message["job"]["progress_percent"], 100)
+
+    def test_socket_queue_position_advances_when_job_ahead_starts(self):
+        first_started, second_started = Event(), Event()
+        release_first, release_second = Event(), Event()
+        calls = []
+
+        def pipeline(*args, **options):
+            calls.append(True)
+            if len(calls) == 1:
+                first_started.set()
+                if not release_first.wait(5):
+                    raise RuntimeError("First job not released")
+            elif len(calls) == 2:
+                second_started.set()
+                if not release_second.wait(5):
+                    raise RuntimeError("Second job not released")
+            return extracted_result()
+
+        with patch("AI.main.doc_pipeline", side_effect=pipeline):
+            first = self.submit().json()["job_id"]
+            try:
+                self.assertTrue(first_started.wait(2))
+                second = self.submit().json()["job_id"]
+                third = self.submit().json()["job_id"]
+                with self.client.websocket_connect(f"/ws/invoices/jobs/{third}") as socket:
+                    self.assertEqual(socket.receive_json()["job"]["queue_position"], 2)
+                    release_first.set()
+                    self.assertTrue(second_started.wait(2))
+                    self.assertEqual(socket.receive_json()["job"]["queue_position"], 1)
+                    detail = self.client.get(f"/api/v1/invoices/jobs/{third}").json()
+                    self.assertEqual(detail["queue_position"], 1)
+            finally:
+                release_first.set()
+                release_second.set()
+                self.terminal(first)
+                if "second" in locals():
+                    self.terminal(second)
+                if "third" in locals():
+                    self.terminal(third)
 
 
 if __name__ == "__main__":

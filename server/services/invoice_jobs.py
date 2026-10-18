@@ -15,6 +15,21 @@ from server.services.invoices import InvoiceProcessor
 
 logger = logging.getLogger(__name__)
 
+STAGES = {
+    "queued": (0, "Waiting in the invoice queue"),
+    "starting": (1, "Worker started; waiting for the shared pipeline if busy"),
+    "loading_tariff_index": (5, "Connecting to the tariff backend and loading reference data"),
+    "loading_models": (10, "Loading or reusing OCR and Qwen models"),
+    "running_ocr": (20, "Reading invoice pages with OCR"),
+    "cleaning_text": (45, "Cleaning the extracted OCR text"),
+    "extracting_json": (55, "Extracting structured invoice JSON"),
+    "retrieving_tariffs": (75, "Retrieving tariff candidates for invoice items"),
+    "classifying_items": (85, "Classifying items and validating tariff codes"),
+    "completed": (99, "Validating and saving the final result"),
+    "failed": (0, "Invoice processing failed"),
+    "interrupted": (0, "Processing interrupted; submit the invoice again"),
+}
+
 
 class InvoiceJobService:
     def __init__(self, root=None, processor=None):
@@ -23,6 +38,7 @@ class InvoiceJobService:
         self.processor = processor or InvoiceProcessor()
         self._instance = uuid4().hex
         self._queue = Queue()
+        self._pending = []
         self._lock = RLock()
         self._worker = None
 
@@ -46,6 +62,14 @@ class InvoiceJobService:
     def _update(self, job_id, **changes):
         with self._lock:
             data = self._read(job_id)
+            if "stage" in changes:
+                percent, description = STAGES.get(changes["stage"], (data.get("progress_percent", 0), changes["stage"]))
+                changes["stage_description"] = description
+                # Failures retain the last reached progress; only saved success is 100%.
+                if changes["stage"] not in {"failed", "interrupted"}:
+                    changes["progress_percent"] = percent
+            if changes.get("status") == JobStatus.SUCCEEDED.value:
+                changes.update(progress_percent=100, stage_description="Invoice processing completed")
             data.update(changes, updated_at=datetime.now(timezone.utc).isoformat())
             self._save(job_id, data)
 
@@ -58,17 +82,21 @@ class InvoiceJobService:
             self.processor.save_upload(stream, filename, folder / "invoice.pdf")
             now = datetime.now(timezone.utc)
             job = InvoiceJobResponse(job_id=job_id, status=JobStatus.QUEUED, stage="queued",
+                                     stage_description=STAGES["queued"][1],
                                      filename=filename.replace("\\", "/").rsplit("/", 1)[-1],
                                      created_at=now, updated_at=now)
             data = job.model_dump(mode="json")
             data.update(_owner_pid=os.getpid(), _owner_instance=self._instance)
             with self._lock:
                 self._save(job_id, data)
+                self._pending.append(job_id)
                 self._queue.put(job_id)
                 if self._worker is None or not self._worker.is_alive():
                     self._worker = Thread(target=self._work, name="invoice-jobs", daemon=True)
                     self._worker.start()
-            return job
+                # Return the acceptance snapshot before the worker can take the lock.
+                job.queue_position = self._pending.index(job_id) + 1
+                return job
         except Exception:
             shutil.rmtree(folder, ignore_errors=True)
             raise
@@ -95,12 +123,26 @@ class InvoiceJobService:
                 self._update(job_id, status=JobStatus.FAILED.value, stage="interrupted",
                              error="Server restarted before processing finished. Submit the invoice again.")
                 data = self._read(job_id)
-            return InvoiceJobResponse.model_validate(data)
+            job = InvoiceJobResponse.model_validate(data)
+            job.stage_description = STAGES.get(job.stage, (0, job.stage))[1]
+            if job.status == JobStatus.SUCCEEDED:
+                job.progress_percent = 100
+                job.stage_description = "Invoice processing completed"
+            elif "progress_percent" not in data:
+                job.progress_percent = STAGES.get(job.stage, (0, ""))[0]
+            if job.status == JobStatus.QUEUED:
+                job.queue_position = self._pending.index(job_id) + 1 if job_id in self._pending else None
+            else:
+                job.queue_position = 0 if job.status == JobStatus.PROCESSING else None
+            return job
 
     def _work(self):
         while True:
             job_id = self._queue.get()
             try:
+                with self._lock:
+                    self._pending.remove(job_id)
+                    self._update(job_id, status=JobStatus.PROCESSING.value, stage="starting")
                 self._run(job_id)
             except Exception:
                 logger.exception("Could not update invoice job %s", job_id)
@@ -117,7 +159,6 @@ class InvoiceJobService:
         result = None
         error = None
         try:
-            self._update(job_id, status=JobStatus.PROCESSING.value, stage="starting")
             filename = self._read(job_id)["filename"]
             with pdf.open("rb") as stream:
                 value = self.processor.process(stream, filename, progress=lambda stage: self._update(job_id, stage=stage))

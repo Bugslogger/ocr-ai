@@ -1,5 +1,82 @@
 # Invoice API
 
+## Live invoice job progress over WebSocket
+
+Upload a PDF with `POST /api/v1/invoices/jobs` (multipart field `file`), then connect to:
+
+```text
+ws://localhost:8000/ws/invoices/jobs/<job_id>?interval=1
+```
+
+Use `wss://<your-host>/ws/invoices/jobs/<job_id>` for HTTPS deployments. This socket monitors the same full extraction job created by the upload API. Fetch its details at any time with `GET /api/v1/invoices/jobs/<job_id>`; REST and socket snapshots expose the same job fields.
+
+```javascript
+async function extractInvoice(file) {
+  const body = new FormData();
+  body.append("file", file);
+  const response = await fetch("/api/v1/invoices/jobs", { method: "POST", body });
+  if (!response.ok) throw new Error(await response.text());
+  const accepted = await response.json();
+  console.log("Job ID:", accepted.job_id);
+  // Save this ID in application state so the user can reconnect later.
+  const url = new URL(`/ws/invoices/jobs/${accepted.job_id}`, location.href);
+  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(url);
+  socket.onmessage = ({ data }) => {
+    const message = JSON.parse(data);
+    if (message.event === "error") {
+      console.error(message.detail);
+      return;
+    }
+    const job = message.job;
+    console.log({
+      jobId: job.job_id,
+      status: job.status,
+      processing: job.stage_description,
+      estimatedPercent: job.progress_percent,
+      queuePosition: job.queue_position,
+    });
+    if (message.event === "completed") console.log("Extracted JSON:", job.result);
+    if (message.event === "failed") console.error(job.error);
+  };
+  socket.onerror = () => console.error("Connection error; reconnect using the saved job ID");
+  return { jobId: accepted.job_id, socket };
+}
+```
+
+Example event while waiting:
+
+```json
+{
+  "event": "progress",
+  "job": {
+    "job_id": "0123456789abcdef0123456789abcdef",
+    "status": "queued",
+    "stage": "queued",
+    "stage_description": "Waiting in the invoice queue",
+    "progress_percent": 0,
+    "progress_is_estimate": true,
+    "queue_position": 2,
+    "filename": "invoice.pdf",
+    "created_at": "2026-10-18T12:00:00Z",
+    "updated_at": "2026-10-18T12:00:00Z",
+    "result": null,
+    "error": null
+  }
+}
+```
+
+- `queue_position`: `1` is the next waiting job; `2` means one waiting job is ahead, plus any job already processing. `0` means the worker has taken the job, though it can still wait for the shared pipeline lock. Terminal jobs use null. Position is also null if a queued job belongs to another process whose queue cannot be inspected.
+- `progress_percent` is a **stage-based estimate**, not measured page/item completion or an elapsed-time prediction. It remains unchanged during a long stage. Stages use 0 (queued), 1 (starting), 5 (tariff setup), 10 (model loading/reuse), 20 (OCR), 45 (cleanup), 55 (JSON extraction), 75 (retrieval), 85 (classification), and 99 (finalization). Only saved success reaches 100. Failures retain the last recorded estimate.
+- `stage` is the machine-readable stage; `stage_description` explains what is processing.
+- The socket immediately sends the current snapshot and sends another at the selected interval (1–60 seconds, default 1). Intermediate stages shorter than that interval may be skipped. Repeated unchanged snapshots also keep the connection active.
+- Events are `progress`, `completed`, or `failed`, each containing `job`. Terminal events include the final result/error and close normally with code `1000`.
+- Unknown or invalid job IDs produce an `error` event with status `404` and close code `4404`. The stream accepts no client messages; unexpected messages close it with `1008`.
+- Disconnecting only stops monitoring; extraction continues. Reconnect with the same job ID for a fresh snapshot or saved result. Server restarts still interrupt active work; this feature does not restart jobs automatically.
+- Use one API worker per GPU. Queue position covers background invoice jobs in that process; direct HTTP/old upload sockets do not have queue numbers. The synchronous `/api/v1/invoices/extract` response has no background job ID: use `/api/v1/invoices/jobs` for this tracked workflow.
+- Authentication and job ownership checks are not implemented. A job ID is not a substitute for authenticated access control.
+
+
 The server supports PDF uploads that return AI invoice JSON directly, plus the existing asynchronous OCR jobs and model-cache status endpoints. Python 3.11 or later is required by the server's existing `StrEnum` schemas.
 
 For connection URLs, PDF upload messages, GPU events, and complete browser/Python clients, see the [WebSocket connection guide](WEBSOCKET_GUIDE.md).
