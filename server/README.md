@@ -2,6 +2,8 @@
 
 The server supports PDF uploads that return AI invoice JSON directly, plus the existing asynchronous OCR jobs and model-cache status endpoints. Python 3.11 or later is required by the server's existing `StrEnum` schemas.
 
+For connection URLs, PDF upload messages, GPU events, and complete browser/Python clients, see the [WebSocket connection guide](WEBSOCKET_GUIDE.md).
+
 ## Start the server
 
 Install the AI and server dependencies from the repository root, using a CUDA-enabled environment with BF16 GPU support for Unlimited-OCR:
