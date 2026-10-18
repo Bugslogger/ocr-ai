@@ -3,3 +3,6 @@ AI/venv/
 __pycache__/
 venv/
 .cache/
+.venv/
+/output/
+/AI/output/

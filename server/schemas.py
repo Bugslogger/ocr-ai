@@ -1,6 +1,7 @@
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -44,3 +45,13 @@ class ModelStatus(BaseModel):
 class ModelsStatusResponse(BaseModel):
     all_downloaded: bool
     models: list[ModelStatus]
+
+
+class ExtractedInvoice(BaseModel):
+    order_level: dict[str, Any]
+    item_level: list[dict[str, Any]] = Field(min_length=1)
+    shipment: dict[str, Any]
+
+
+class InvoiceExtractionResponse(BaseModel):
+    invoices: list[ExtractedInvoice] = Field(min_length=1)

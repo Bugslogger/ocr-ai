@@ -1,0 +1,18 @@
+# Model API compatibility follows the notebook's Transformers version.
+torch>=2.6,<3
+torchvision>=0.21,<1
+transformers==4.57.1
+accelerate>=1,<2
+safetensors>=0.4,<1
+huggingface-hub>=0.34,<1
+Pillow>=10,<13
+PyMuPDF>=1.25,<2
+einops>=0.8,<1
+addict==2.4.0
+easydict==1.13
+matplotlib>=3.9,<4
+psutil>=6,<8
+pycountry>=24.6.1,<27
+jsonschema>=4.23,<5
+# Optional Weaviate backend; not contacted by the default catalog workflow.
+weaviate-client>=4.16,<5
