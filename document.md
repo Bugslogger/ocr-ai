@@ -1,8 +1,27 @@
 # Invoice AI: architecture, processing flow, and usage
 
+## Socket.IO: multiple events on one connection
+
+Connect a Socket.IO v4 client to the API origin with `path: "/socket.io"`. One connection supports `invoice:submit`, job lookup/subscription, progress/queue updates, final JSON, and GPU status. See the [complete Socket.IO guide](server/SOCKETIO_GUIDE.md) for event payloads and a working browser example. The older `/ws/...` endpoints use plain WebSocket protocols and remain available.
+
+
+## Extraction requests and timeouts
+
+`POST /api/v1/invoices/extract` now returns **202 with a background job ID by default** after receiving and validating the PDF. It does not keep the upload request open during model loading or inference. Existing clients expecting final invoice JSON in this response must handle the job workflow below, or explicitly opt into synchronous mode with `?wait=true` (which remains susceptible to proxy timeouts).
+
+```bash
+curl -X POST http://localhost:8000/api/v1/invoices/extract \
+  -F 'file=@invoice.pdf;type=application/pdf'
+# Use the returned job_id:
+curl http://localhost:8000/api/v1/invoices/jobs/JOB_ID
+```
+
+For live progress on the shared Socket.IO connection, emit `invoice:subscribe` with `{job_id: "JOB_ID"}`. The plain WebSocket alternative is `/ws/invoices/jobs/JOB_ID`. On completion, the job snapshot contains the extracted JSON in `result`. This change avoids holding an HTTP request open for inference; it does not speed up OCR or model execution, and upload/validation still take time. The existing `POST /api/v1/invoices/jobs` remains available with the same background behavior.
+
+
 This document describes the current implementation in `AI/` and `server/`. The application accepts an invoice PDF, runs OCR, extracts structured invoice data with Qwen, retrieves tariff candidates, and returns classified invoice JSON. One PDF can contain multiple invoices and multiple line items.
 
-For web applications, use **background invoice jobs**: upload the PDF, receive a job ID after validation, then poll for progress and the result. Direct HTTP extraction and WebSocket extraction run the same AI pipeline.
+For web applications, use **background invoice jobs**: upload the PDF, receive a job ID after validation, then subscribe through Socket.IO for progress and the result, or poll the job API. Socket.IO uploads, HTTP uploads, and plain WebSocket extraction use the same AI pipeline.
 
 ## 1. Project tree
 
@@ -34,6 +53,7 @@ workspace/
 │   │   └── gpu.py                      # GPU status REST route
 │   ├── api/
 │   │   ├── rest.py                     # Health and older path-based OCR job routes
+│   │   ├── socketio.py                 # Multiplexed Socket.IO invoice and GPU events
 │   │   ├── invoice_websocket.py        # Binary PDF upload and full extraction socket
 │   │   ├── invoice_job_websocket.py    # Reconnectable invoice job progress stream
 │   │   ├── gpu_websocket.py            # Live GPU/configuration stream
@@ -49,6 +69,7 @@ workspace/
 │   ├── tests/                          # REST, WebSocket, jobs, models, and GPU tests
 │   ├── requirements.txt
 │   ├── README.md                       # Setup, operations, and API examples
+│   ├── SOCKETIO_GUIDE.md                # Named events and single-connection client examples
 │   └── WEBSOCKET_GUIDE.md              # Socket protocols and complete client examples
 └── output/                             # Runtime-generated output, when used
     └── invoice_jobs/                   # Default background invoice job storage
@@ -67,8 +88,11 @@ The diagrams use Mermaid. Open this document in a Markdown viewer that supports 
 flowchart TD
     User[Web application or API client] --> Proxy[Reverse proxy when deployed]
     Proxy --> API[FastAPI server.app]
+    API --> SIO[Socket.IO at /socket.io]
+    SIO --> Queue
+    SIO --> Monitor
     API --> Jobs[Background invoice routes]
-    API --> Direct[Direct HTTP extraction]
+    API --> Direct[Explicit synchronous extraction]
     API --> Socket[Invoice WebSocket]
     Jobs --> Queue[Process-local FIFO queue]
     Queue --> Worker[One background worker thread]
@@ -94,10 +118,11 @@ The API upload paths default to **Weaviate**. The CLI defaults to **catalog** re
 
 | Transport | Endpoint | Purpose |
 | --- | --- | --- |
+| Socket.IO | `/socket.io/` | One connection for invoice upload, job progress/details, and GPU events |
 | GET | `/api/v1/health` | Basic API liveness; does not prove models or database are ready |
 | POST | `/api/v1/invoices/jobs` | Upload multipart PDF field `file`; return `202` and a job ID |
 | GET | `/api/v1/invoices/jobs/{job_id}` | Read progress, final JSON, or failure |
-| POST | `/api/v1/invoices/extract` | Upload multipart PDF field `file`; wait for final JSON |
+| POST | `/api/v1/invoices/extract` | Upload PDF; return `202` job by default; `?wait=true` waits for JSON |
 | WebSocket | `/ws/invoices/jobs/{job_id}` | Monitor job ID, estimated progress, queue position, and final result |
 | WebSocket | `/ws/invoices/extract` | Upload PDF bytes, receive progress and final JSON |
 | POST | `/api/v1/models/download` | Download both model repositories to disk; no body required |
@@ -109,6 +134,223 @@ The API upload paths default to **Weaviate**. The CLI defaults to **catalog** re
 | WebSocket | `/ws/jobs/{job_id}` | Subscribe to older OCR-only job events |
 
 `/api/v1/jobs` and `/api/v1/invoices/jobs` are different services. The older service returns OCR text file paths; the invoice service returns full extracted and classified JSON. The older `/ws/jobs/{job_id}` socket does not subscribe to full invoice jobs.
+
+## 3a. Socket.IO: one connection, multiple events
+
+```mermaid
+sequenceDiagram
+    participant Web as Web application
+    participant Socket as Socket.IO at /socket.io
+    participant Queue as Invoice job queue
+    participant Worker as AI worker
+    Web->>Socket: Connect once using socket.io-client
+    Socket-->>Web: session:ready
+    Web->>Socket: gpu:subscribe with interval
+    Socket-->>Web: gpu:status
+    Web->>Socket: invoice:submit with filename and binary PDF
+    Socket->>Queue: Validate PDF, save job, enqueue ID
+    Socket-->>Web: invoice:accepted with job ID and acknowledgement
+    Queue->>Worker: Start next invoice
+    loop While invoice is queued or processing
+        Socket-->>Web: invoice:progress with stage, estimate, and queue position
+        Socket-->>Web: gpu:status on same connection
+    end
+    Worker->>Queue: Save final result or failure
+    Socket-->>Web: invoice:completed or invoice:failed
+    Note over Web,Socket: Connection remains open for other events
+    Web->>Socket: invoice:get with saved job ID
+    Socket-->>Web: invoice:details with saved result
+    Note over Web,Socket: After reconnect, subscribe again using saved IDs
+```
+
+The server now supports Socket.IO at **`/socket.io/`**, using the default namespace `/`. Connect a Socket.IO v4 JavaScript client to the **server origin**, then emit named events over that connection. The existing REST and plain WebSocket routes remain available.
+
+### Setup and connection
+
+Install the updated backend dependencies and run the existing application entry point:
+
+```bash
+cd /workspace
+server/venv/bin/python -m pip install -r server/requirements.txt
+server/venv/bin/python -m uvicorn server.app:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+For a frontend running on a different origin, set the allowed frontend origins **before server startup**:
+
+```bash
+export SOCKETIO_ALLOWED_ORIGINS='http://localhost:3000,http://localhost:5173,https://your-frontend.example'
+```
+
+The default is same-origin checking. Origins include scheme and port, without a path or trailing slash. This setting configures the Socket.IO transport; it does not add CORS middleware for browser REST calls. Use one server process per GPU with the existing process-local queue and model cache.
+
+Install the browser client in your frontend project:
+
+```bash
+npm install socket.io-client@^4
+```
+
+```javascript
+import { io } from "socket.io-client";
+
+const socket = io("http://localhost:8000", {
+  path: "/socket.io",
+  transports: ["websocket"],
+  reconnection: true,
+});
+```
+
+For deployment use `https://<your-api-host>` as the origin; the library uses secure WebSocket transport automatically. For the current proxy, that origin is `https://0vg1ro1l0y6vox-8001.proxy.runpod.net`.
+
+Keep `path: "/socket.io"` unless the proxy explicitly rewrites that path. Do not put `/ws/invoices/extract` in the Socket.IO connection URL. A native `new WebSocket(...)` client cannot speak the Socket.IO protocol. Configure the proxy to forward `/socket.io/`, its query string, and WebSocket Upgrade/Connection headers to the API server. HTTP polling is supported as well, but the examples use WebSocket transport to carry PDFs without polling/base64 overhead.
+
+### Event contract
+
+All requests are sent on the same connection. Request acknowledgements return `{ok: true, ...}` on success or `{ok: false, event, status, detail}` on error. Errors also emit `request:error` to the requesting connection. Invoice results are sent only to the submitting/subscribing connection, with no global broadcast.
+
+| Client emits | Payload | Server emits / acknowledgement |
+| --- | --- | --- |
+| `invoice:submit` | `{filename, pdf: ArrayBuffer}` | `invoice:accepted` and ACK `{ok, job}`; automatically subscribes to progress |
+| `invoice:subscribe` | `{job_id, interval?: 1}` | ACK `{ok, job}`; starts snapshots for that ID |
+| `invoice:unsubscribe` | `{job_id}` | ACK `{ok, job_id}`; stops monitoring that job |
+| `invoice:get` | `{job_id}` | `invoice:details` and ACK `{ok, job}` |
+| `gpu:subscribe` | `{interval?: 2}` | ACK `{ok, interval}`; starts `gpu:status` snapshots |
+| `gpu:unsubscribe` | `{}` | ACK `{ok}`; stops GPU snapshots |
+| `gpu:get` | `{}` | `gpu:status` and ACK `{ok, data}` |
+
+| Server emits | Payload and meaning |
+| --- | --- |
+| `session:ready` | `{sid, max_upload_bytes}`; connected session information |
+| `invoice:accepted` | `{ok: true, job}`; PDF validated and background job saved/queued |
+| `invoice:progress` | `{job}`; periodic progress and queue snapshot |
+| `invoice:completed` | `{job}`; terminal success; final JSON is `job.result` |
+| `invoice:failed` | `{job}`; terminal failure; reason is `job.error` |
+| `invoice:details` | `{ok: true, job}`; requested job snapshot |
+| `gpu:status` | `{ok: true, data}`; GPU availability, usage, and runtime config |
+| `request:error` | `{ok: false, event, status, detail}`; individual request or monitoring failure |
+
+A terminal invoice event stops that job's subscription, **not the connection**. GPU and other invoice events continue. One connection can subscribe to several job IDs. Subscribing again to the same ID replaces its previous monitoring task. Intervals must be 1–60 seconds. GPU subscription has one task per connection.
+
+### Browser example: upload, track, and reconnect
+
+Register listeners once. Keep job IDs outside the connection handler so reconnect can resubscribe without submitting invoices twice.
+
+```javascript
+import { io } from "socket.io-client";
+
+const socket = io("http://localhost:8000", {
+  path: "/socket.io",
+  transports: ["websocket"],
+  autoConnect: false,
+});
+const trackedJobs = new Set();
+
+function showJob(job) {
+  console.log({
+    jobId: job.job_id,
+    status: job.status,
+    processing: job.stage_description,
+    estimatedPercent: job.progress_percent,
+    queuePosition: job.queue_position,
+  });
+}
+
+socket.on("connect", () => {
+  console.log("Connected:", socket.id);
+  for (const job_id of trackedJobs) {
+    socket.emit("invoice:subscribe", { job_id });
+  }
+  socket.emit("gpu:subscribe", { interval: 2 });
+});
+socket.on("connect_error", (error) => console.error("Connection failed:", error.message));
+socket.on("request:error", (error) => console.error(error.event, error.status, error.detail));
+socket.on("invoice:accepted", ({ job }) => {
+  trackedJobs.add(job.job_id);
+  // Persist this ID in application storage if it must survive a page refresh.
+  showJob(job);
+});
+socket.on("invoice:progress", ({ job }) => showJob(job));
+socket.on("invoice:details", ({ job }) => showJob(job));
+socket.on("invoice:completed", ({ job }) => {
+  trackedJobs.delete(job.job_id);
+  showJob(job);
+  console.log("Extracted JSON:", job.result);
+});
+socket.on("invoice:failed", ({ job }) => {
+  trackedJobs.delete(job.job_id);
+  showJob(job);
+  console.error("Extraction failed:", job.error);
+});
+socket.on("gpu:status", ({ data }) => console.log("GPU and config:", data));
+socket.connect();
+
+// Call from your file-input or submit handler, after the socket connects.
+export async function uploadInvoice(file) {
+  if (!socket.connected) throw new Error("Wait for the socket to connect");
+  const pdf = await file.arrayBuffer();
+  socket.timeout(60000).emit("invoice:submit", { filename: file.name, pdf }, (error, reply) => {
+    if (error) {
+      // The upload may already have been accepted: check invoice:accepted and
+      // saved IDs before retrying, to avoid submitting duplicate jobs.
+      console.error("Upload acknowledgement timed out", error);
+    } else if (!reply.ok) {
+      console.error(reply.detail);
+    } else {
+      console.log("Job ID:", reply.job.job_id);
+    }
+  });
+}
+
+// Lookup without starting another extraction:
+export function fetchJob(job_id) {
+  socket.emit("invoice:get", { job_id });
+}
+
+// Track a job created by POST /api/v1/invoices/extract or /invoices/jobs:
+export function watchExistingJob(job_id) {
+  trackedJobs.add(job_id);
+  socket.emit("invoice:subscribe", { job_id });
+}
+
+export function stopWatching(job_id) {
+  trackedJobs.delete(job_id);
+  socket.emit("invoice:unsubscribe", { job_id });
+}
+```
+
+The PDF is one binary attachment, not a base64 string, server file path, or multipart message. The default PDF limit is 25 MiB (`INVOICE_MAX_UPLOAD_BYTES`). For large uploads or a frontend with existing HTTP upload code, submit through the REST extraction endpoint and subscribe to the returned ID using this same Socket.IO connection. Socket.IO upload submission does not run inference inline.
+
+### Progress and queue semantics
+
+Every `job` uses the same schema as `GET /api/v1/invoices/jobs/{job_id}`:
+
+```text
+job
+├── job_id, filename, created_at, updated_at
+├── status                         queued | processing | succeeded | failed
+├── stage                          machine-readable current step
+├── stage_description              human-readable processing activity
+├── progress_percent               estimated stage progress, 0–100
+├── progress_is_estimate            true
+├── queue_position                 1 = next waiting; 0 = worker has taken job
+├── result                         extracted invoice JSON on success
+└── error                          error message on failure
+```
+
+Queue position is null for terminal jobs or a queued job owned by another process whose queue is unavailable. It counts waiting background jobs, excluding the currently processing job. `0` can include waiting for a direct synchronous call to release the pipeline lock. Progress is stage-based and can remain unchanged during a long OCR/model stage. Only persisted success reaches 100 percent. Samples can skip stages that complete between intervals.
+
+Disconnecting unsubscribes monitoring tasks without canceling extraction. Reconnect and emit `invoice:subscribe` with saved job IDs; subscriptions do not survive a new connection automatically. Finished results remain available from both `invoice:get` and REST if job storage persists. A server restart still interrupts active extraction; Socket.IO does not restart those jobs.
+
+### Troubleshooting
+
+- Install dependencies in the interpreter that runs Uvicorn, then restart the server to load the Socket.IO mount.
+- Use `socket.io-client` v4, the API origin, path `/socket.io`, and default namespace `/`. Existing `/ws/...` URLs use plain WebSocket protocols.
+- If the browser origin differs, set `SOCKETIO_ALLOWED_ORIGINS` to the frontend's exact origin before starting the server.
+- Verify the proxy forwards `/socket.io/` to port 8000 with WebSocket upgrades. The existing nginx include sets the upgrade headers; the enclosing proxy location must also cover this path.
+- Polling handshake check: `curl 'http://localhost:8000/socket.io/?EIO=4&transport=polling'`. A successful Engine.IO opening packet begins with `0` and includes a session ID.
+- `request:error` codes include 413 (upload too large), 415 (wrong filename type), 422 (invalid payload or PDF), 404 (job missing), and 502 (internal failure). A request error usually leaves the connection open.
+- User authentication and job ownership are not implemented. Knowing a job ID permits lookup/subscription, as with the REST endpoint.
+
+Implementation: [Socket.IO event handlers](server/api/socketio.py), [application mount](server/app.py), and [protocol integration tests](server/tests/test_socketio.py). Protocol integration follows the [official python-socketio ASGI and event documentation](https://python-socketio.readthedocs.io/en/stable/server.html).
 
 ## 4. Recommended flow: background PDF upload
 
@@ -265,7 +507,7 @@ Example event while waiting:
 - Events are `progress`, `completed`, or `failed`, each containing `job`. Terminal events include the final result/error and close normally with code `1000`.
 - Unknown or invalid job IDs produce an `error` event with status `404` and close code `4404`. The stream accepts no client messages; unexpected messages close it with `1008`.
 - Disconnecting only stops monitoring; extraction continues. Reconnect with the same job ID for a fresh snapshot or saved result. Server restarts still interrupt active work; this feature does not restart jobs automatically.
-- Use one API worker per GPU. Queue position covers background invoice jobs in that process; direct HTTP/old upload sockets do not have queue numbers. The synchronous `/api/v1/invoices/extract` response has no background job ID: use `/api/v1/invoices/jobs` for this tracked workflow.
+- Use one API worker per GPU. Queue position covers background invoice jobs in that process; explicit synchronous HTTP calls and old upload sockets do not have queue numbers. `POST /api/v1/invoices/extract` now uses this tracked background workflow by default, returning `202` with a job ID. Only `/api/v1/invoices/extract?wait=true` waits synchronously and returns no job ID.
 - Authentication and job ownership checks are not implemented. A job ID is not a substitute for authenticated access control.
 
 ## 5. Complete AI processing flow
@@ -334,16 +576,18 @@ result
 
 This hierarchy summarizes fields; `AI/schema.py` defines the exact extraction contract, and `AI/tariff.py` adds classification fields. Review flags take priority over model confidence. Structural validation does not prove that every line was read correctly or that a tariff classification is legally applicable.
 
-## 6. Direct HTTP extraction
+## 6. Extraction API and optional synchronous mode
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/invoices/extract \
+curl -X POST 'http://localhost:8000/api/v1/invoices/extract?wait=true' \
   -F 'file=@invoice.pdf;type=application/pdf'
 ```
 
-Flow: upload → validate → temporary staging → pipeline lock → complete AI processing → validate API result → HTTP response containing `{"invoices": [...]}`.
+Default flow: upload → validate and stage → return `202` with job ID → background processing → fetch result by ID. Use the job socket for progress. The example above opts into synchronous mode.
 
-This route keeps the request open until processing finishes, including time spent waiting for the pipeline lock. FastAPI runs the synchronous handler in a worker thread. Long inference or queue waits can exceed nginx or external proxy timeouts. A proxy timeout does not provide a saved job ID or guarantee that backend processing stopped. Use background jobs for long-running web uploads.
+Synchronous flow: upload → validate → temporary staging → pipeline lock → complete AI processing → validate API result → HTTP response containing `{"invoices": [...]}`.
+
+With `wait=true`, this route keeps the request open until processing finishes, including time spent waiting for the pipeline lock. FastAPI runs the synchronous handler in a worker thread. Long inference or queue waits can exceed nginx or external proxy timeouts. A proxy timeout does not provide a saved job ID or guarantee that backend processing stopped. Use background jobs for long-running web uploads.
 
 ## 7. Invoice WebSocket flow
 
@@ -502,6 +746,7 @@ For a successful CLI run, the output directory contains:
 
 | Setting | Default / behavior |
 | --- | --- |
+| `SOCKETIO_ALLOWED_ORIGINS` | Comma-separated frontend origins; default same-origin Socket.IO checking |
 | `INVOICE_TARIFF_BACKEND` | `weaviate` for API uploads; alternative `catalog` |
 | `WEAVIATE_HOST` | `32.236.127.40`; no database API key is required |
 | `WEAVIATE_HTTP_PORT` / `WEAVIATE_GRPC_PORT` | `8080` / `50051` |
@@ -541,7 +786,7 @@ Check API health
     └── Check/download model repository files
         └── Upload invoice to background jobs endpoint
             └── Save returned job ID in the web application
-                └── Poll until succeeded or failed
+                └── Subscribe with invoice:subscribe or poll until succeeded or failed
                     ├── succeeded → display result.invoices and review flags
                     └── failed    → display error and inspect server logs
 ```
@@ -565,6 +810,7 @@ There is no automatic financial-total reconciliation, oversized-document splitti
 
 ## 15. Further documentation
 
+- [Socket.IO connection, named events, and client examples](server/SOCKETIO_GUIDE.md)
 - [Server setup, API usage, and deployment](server/README.md)
 - [WebSocket protocols and complete client examples](server/WEBSOCKET_GUIDE.md)
 - [AI pipeline, classification contract, and verification](AI/README.md)

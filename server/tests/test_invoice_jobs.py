@@ -84,6 +84,41 @@ class InvoiceJobTests(TestCase):
         restored = InvoiceJobService(root=self.directory.name).get(job_id)
         self.assertEqual(restored.result.model_dump(), expected)
 
+    def test_extract_returns_job_without_waiting_for_inference(self):
+        started, release = Event(), Event()
+
+        def pipeline(*args, **options):
+            options["progress"]("running_ocr")
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("Inference not released")
+            return extracted_result()
+
+        with patch("AI.main.doc_pipeline", side_effect=pipeline):
+            job_id = None
+            try:
+                response = self.client.post("/api/v1/invoices/extract", files={"file": ("invoice.pdf", pdf_bytes())})
+                self.assertEqual(response.status_code, 202, response.text)
+                job_id = response.json()["job_id"]
+                self.assertTrue(started.wait(2))
+                self.assertFalse(release.is_set())
+                self.assertEqual(response.headers["location"], f"/api/v1/invoices/jobs/{job_id}")
+                self.assertEqual(response.headers["retry-after"], "2")
+                with self.client.websocket_connect(f"/ws/invoices/jobs/{job_id}") as socket:
+                    self.assertEqual(socket.receive_json()["job"]["stage"], "running_ocr")
+            finally:
+                release.set()
+                if job_id:
+                    self.terminal(job_id)
+        self.assertEqual(self.client.get(response.headers["location"]).json()["result"], extracted_result())
+
+    def test_extract_default_validates_before_acceptance(self):
+        for filename, content, status in [("invoice.txt", b"text", 415), ("invoice.pdf", b"broken", 422)]:
+            with self.subTest(filename=filename), patch("AI.main.doc_pipeline") as run:
+                response = self.client.post("/api/v1/invoices/extract", files={"file": (filename, content)})
+                self.assertEqual(response.status_code, status)
+                run.assert_not_called()
+
     def test_pipeline_failure_is_pollable_and_upload_is_deleted(self):
         with patch("AI.main.doc_pipeline", side_effect=RuntimeError("private credentials")), self.assertLogs(
             "server.services.invoice_jobs", level="ERROR"

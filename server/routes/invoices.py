@@ -1,8 +1,8 @@
-"""Synchronous upload-to-JSON API, executed by FastAPI's worker thread pool."""
+"""Queued invoice extraction with opt-in synchronous responses."""
 from typing import Annotated
 import logging
 
-from fastapi import APIRouter, File, HTTPException, Response, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile
 
 from server.schemas import InvoiceExtractionResponse, InvoiceJobResponse
 from server.services.invoice_jobs import invoice_jobs
@@ -45,17 +45,27 @@ def get_invoice_job(job_id: str, response: Response) -> InvoiceJobResponse:
 
 @router.post(
     "/extract",
-    response_model=InvoiceExtractionResponse,
-    summary="Extract synchronously; use /invoices/jobs for long-running requests",
+    response_model=InvoiceJobResponse | InvoiceExtractionResponse,
+    summary="Queue invoice extraction; use wait=true only for synchronous clients",
     responses={
+        202: {"model": InvoiceJobResponse, "description": "PDF accepted for background extraction"},
         413: {"description": "Invoice exceeds the configured upload limit"},
         415: {"description": "A .pdf file is required"},
         422: {"description": "Missing file, invalid PDF, or password-protected PDF"},
         502: {"description": "AI extraction or tariff retrieval failed"},
     },
 )
-def extract_invoice(file: Annotated[UploadFile, File(description="Invoice PDF")]) -> InvoiceExtractionResponse:
-    """Wait for OCR, extraction, and classification, then return all invoices."""
+def extract_invoice(
+    file: Annotated[UploadFile, File(description="Invoice PDF")],
+    response: Response,
+    wait: Annotated[bool, Query(description="Wait for final JSON; long requests can exceed proxy timeouts")] = False,
+) -> InvoiceJobResponse | InvoiceExtractionResponse:
+    """Return a tracked job by default; opt in to waiting for final invoice JSON."""
+    if not wait:
+        # Reuse upload validation, persistence, queueing, and stream closure.
+        job = create_invoice_job(file, response)
+        response.status_code = 202
+        return job
     try:
         result = processor.process(file.file, file.filename)
         return InvoiceExtractionResponse.model_validate(result)

@@ -52,7 +52,7 @@ class InvoiceWebSocketTests(TestCase):
             return deepcopy(expected)
 
         with patch("AI.main.doc_pipeline", side_effect=pipeline):
-            http_result = self.client.post("/api/v1/invoices/extract", files={"file": ("invoice.pdf", data)})
+            http_result = self.client.post("/api/v1/invoices/extract?wait=true", files={"file": ("invoice.pdf", data)})
             with self.client.websocket_connect("/ws/invoices/extract") as socket:
                 socket.send_json({"filename": "../../invoice.PDF", "size": len(data)})
                 self.assertEqual(socket.receive_json()["event"], "ready")

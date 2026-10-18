@@ -1,5 +1,24 @@
 # Invoice API
 
+## Socket.IO: multiple events on one connection
+
+Connect a Socket.IO v4 client to the API origin with `path: "/socket.io"`. One connection supports `invoice:submit`, job lookup/subscription, progress/queue updates, final JSON, and GPU status. See the [complete Socket.IO guide](SOCKETIO_GUIDE.md) for event payloads and a working browser example. The older `/ws/...` endpoints use plain WebSocket protocols and remain available.
+
+
+## Extraction requests and timeouts
+
+`POST /api/v1/invoices/extract` now returns **202 with a background job ID by default** after receiving and validating the PDF. It does not keep the upload request open during model loading or inference. Existing clients expecting final invoice JSON in this response must handle the job workflow below, or explicitly opt into synchronous mode with `?wait=true` (which remains susceptible to proxy timeouts).
+
+```bash
+curl -X POST http://localhost:8000/api/v1/invoices/extract \
+  -F 'file=@invoice.pdf;type=application/pdf'
+# Use the returned job_id:
+curl http://localhost:8000/api/v1/invoices/jobs/JOB_ID
+```
+
+For live progress, connect to `/ws/invoices/jobs/JOB_ID`. On completion, the job snapshot contains the extracted JSON in `result`. This change avoids holding an HTTP request open for inference; it does not speed up OCR or model execution, and upload/validation still take time. The existing `POST /api/v1/invoices/jobs` remains available with the same background behavior.
+
+
 ## Live invoice job progress over WebSocket
 
 Upload a PDF with `POST /api/v1/invoices/jobs` (multipart field `file`), then connect to:
@@ -73,7 +92,7 @@ Example event while waiting:
 - Events are `progress`, `completed`, or `failed`, each containing `job`. Terminal events include the final result/error and close normally with code `1000`.
 - Unknown or invalid job IDs produce an `error` event with status `404` and close code `4404`. The stream accepts no client messages; unexpected messages close it with `1008`.
 - Disconnecting only stops monitoring; extraction continues. Reconnect with the same job ID for a fresh snapshot or saved result. Server restarts still interrupt active work; this feature does not restart jobs automatically.
-- Use one API worker per GPU. Queue position covers background invoice jobs in that process; direct HTTP/old upload sockets do not have queue numbers. The synchronous `/api/v1/invoices/extract` response has no background job ID: use `/api/v1/invoices/jobs` for this tracked workflow.
+- Use one API worker per GPU. Queue position covers background invoice jobs in that process; explicit synchronous HTTP calls and old upload sockets do not have queue numbers. `POST /api/v1/invoices/extract` now uses this tracked background workflow by default, returning `202` with a job ID. Only `/api/v1/invoices/extract?wait=true` waits synchronously and returns no job ID.
 - Authentication and job ownership checks are not implemented. A job ID is not a substitute for authenticated access control.
 
 
@@ -133,7 +152,7 @@ nginx -s reload
 
 The original host configuration was backed up to `/etc/nginx/nginx.conf.invoice-api.bak`. Host nginx configuration may need to be reapplied when recreating the container. Any external proxy or client timeout must also allow the requested processing time; this local change does not configure an external gateway.
 
-After a timed-out download, check `GET /api/v1/models/status` before starting it again: downloaded files remain in the cache. For streamed invoice progress and results, use `/ws/invoices/extract`. The HTTP upload and download endpoints continue to return their result in the same request.
+After a timed-out download, check `GET /api/v1/models/status` before starting it again: downloaded files remain in the cache. For streamed invoice progress and results, use `/ws/invoices/extract`. Invoice uploads now return a background job by default; the model download endpoint remains synchronous.
 
 ## Download and store the models
 
@@ -278,20 +297,20 @@ Job metadata and final results are saved atomically under `INVOICE_JOB_DIR`, whi
 
 Run one API worker per GPU. Use the normal server command without `--reload` while processing invoices: a restart or automatic reload interrupts active/queued jobs. Interrupted jobs are marked failed when polled after their owner exits; they are not automatically resumed and must be submitted again. Finished results remain readable. These full-pipeline jobs are separate from the older OCR-only `/api/v1/jobs` endpoints.
 
-A Cloudflare **524** is an outer gateway timeout, separate from local nginx's **504**. The attached incident was an invoice extraction request that remained open through inference. Increasing the local nginx read timeout does not change Cloudflare's limit. [Cloudflare recommends status polling for long-running HTTP operations](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/). Keep `/api/v1/invoices/extract` for synchronous calls that fit the proxy/client timeout, or use `/ws/invoices/extract` for streamed progress.
+A Cloudflare **524** is an outer gateway timeout, separate from local nginx's **504**. The attached incident was an invoice extraction request that remained open through inference. Increasing the local nginx read timeout does not change Cloudflare's limit. [Cloudflare recommends status polling for long-running HTTP operations](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-524/). Use `/api/v1/invoices/extract?wait=true` only for synchronous calls that fit the proxy/client timeout, or use `/ws/invoices/extract` for streamed progress.
 
 ## Upload an invoice and receive JSON
 
 **`POST /api/v1/invoices/extract`** accepts `multipart/form-data` with one required field named `file`. The filename must end in `.pdf`; the server also checks that the content is a readable, unencrypted PDF before invoking AI.
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/invoices/extract \
+curl -X POST 'http://localhost:8000/api/v1/invoices/extract?wait=true' \
   -F "file=@/absolute/path/invoice.pdf;type=application/pdf"
 ```
 
 In Windows PowerShell, use `curl.exe` and your Windows PDF path. In Postman, choose **Body → form-data**, add a key named `file` with type **File**, select the PDF, and send the request. The `/docs` interface also provides an upload control for this endpoint.
 
-This synchronous HTTP request waits for the complete pipeline and can exceed an external gateway timeout. Prefer `/api/v1/invoices/jobs` through Cloudflare. Successful synchronous responses return status `200` and the AI result as a JSON object with `invoices`, rather than a job ID, file path, or encoded JSON string. For example, the response structure below abbreviates the extraction fields:
+The example explicitly opts in with `wait=true`. Without that option, the endpoint returns `202` with a job ID, `Location`, and `Retry-After` after upload validation; monitor `/ws/invoices/jobs/{job_id}` or GET the `Location` URL for the result. Existing clients expecting `200` and final JSON must add `?wait=true`, which can still time out. This synchronous HTTP request waits for the complete pipeline and can exceed an external gateway timeout. Prefer `/api/v1/invoices/jobs` through Cloudflare. Successful synchronous responses return status `200` and the AI result as a JSON object with `invoices`, rather than a job ID, file path, or encoded JSON string. For example, the response structure below abbreviates the extraction fields:
 
 ```json
 {

@@ -1,5 +1,24 @@
 # WebSocket connection and client guide
 
+## Socket.IO: multiple events on one connection
+
+Connect a Socket.IO v4 client to the API origin with `path: "/socket.io"`. One connection supports `invoice:submit`, job lookup/subscription, progress/queue updates, final JSON, and GPU status. See the [complete Socket.IO guide](SOCKETIO_GUIDE.md) for event payloads and a working browser example. The older `/ws/...` endpoints use plain WebSocket protocols and remain available.
+
+
+## Extraction requests and timeouts
+
+`POST /api/v1/invoices/extract` now returns **202 with a background job ID by default** after receiving and validating the PDF. It does not keep the upload request open during model loading or inference. Existing clients expecting final invoice JSON in this response must handle the job workflow below, or explicitly opt into synchronous mode with `?wait=true` (which remains susceptible to proxy timeouts).
+
+```bash
+curl -X POST http://localhost:8000/api/v1/invoices/extract \
+  -F 'file=@invoice.pdf;type=application/pdf'
+# Use the returned job_id:
+curl http://localhost:8000/api/v1/invoices/jobs/JOB_ID
+```
+
+For live progress, connect to `/ws/invoices/jobs/JOB_ID`. On completion, the job snapshot contains the extracted JSON in `result`. This change avoids holding an HTTP request open for inference; it does not speed up OCR or model execution, and upload/validation still take time. The existing `POST /api/v1/invoices/jobs` remains available with the same background behavior.
+
+
 ## Live invoice job progress over WebSocket
 
 Upload a PDF with `POST /api/v1/invoices/jobs` (multipart field `file`), then connect to:
@@ -73,7 +92,7 @@ Example event while waiting:
 - Events are `progress`, `completed`, or `failed`, each containing `job`. Terminal events include the final result/error and close normally with code `1000`.
 - Unknown or invalid job IDs produce an `error` event with status `404` and close code `4404`. The stream accepts no client messages; unexpected messages close it with `1008`.
 - Disconnecting only stops monitoring; extraction continues. Reconnect with the same job ID for a fresh snapshot or saved result. Server restarts still interrupt active work; this feature does not restart jobs automatically.
-- Use one API worker per GPU. Queue position covers background invoice jobs in that process; direct HTTP/old upload sockets do not have queue numbers. The synchronous `/api/v1/invoices/extract` response has no background job ID: use `/api/v1/invoices/jobs` for this tracked workflow.
+- Use one API worker per GPU. Queue position covers background invoice jobs in that process; explicit synchronous HTTP calls and old upload sockets do not have queue numbers. `POST /api/v1/invoices/extract` now uses this tracked background workflow by default, returning `202` with a job ID. Only `/api/v1/invoices/extract?wait=true` waits synchronously and returns no job ID.
 - Authentication and job ownership checks are not implemented. A job ID is not a substitute for authenticated access control.
 
 

@@ -59,7 +59,7 @@ class InvoiceUploadTests(TestCase):
             return deepcopy(expected)
 
         with patch("AI.main.doc_pipeline", side_effect=pipeline) as run:
-            response = self.client.post("/api/v1/invoices/extract", files={
+            response = self.client.post("/api/v1/invoices/extract?wait=true", files={
                 "file": ("../../invoice.PDF", pdf_bytes(), "application/pdf")
             })
         self.assertEqual(response.status_code, 200, response.text)
@@ -86,7 +86,7 @@ class InvoiceUploadTests(TestCase):
         ), patch("AI.main.make_generator", return_value=generate), patch(
             "AI.main.CatalogRetriever.load", return_value=retriever
         ):
-            response = self.client.post("/api/v1/invoices/extract", files={"file": ("invoice.pdf", pdf_bytes())})
+            response = self.client.post("/api/v1/invoices/extract?wait=true", files={"file": ("invoice.pdf", pdf_bytes())})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(response.json()["invoices"]), 2)
         for invoice in response.json()["invoices"]:
@@ -101,27 +101,27 @@ class InvoiceUploadTests(TestCase):
 
     def test_non_pdf_filename_rejected_before_pipeline(self):
         with patch("AI.main.doc_pipeline") as run:
-            response = self.client.post("/api/v1/invoices/extract", files={"file": ("invoice.txt", b"text")})
+            response = self.client.post("/api/v1/invoices/extract?wait=true", files={"file": ("invoice.txt", b"text")})
         self.assertEqual(response.status_code, 415)
         run.assert_not_called()
 
     def test_empty_and_malformed_files_rejected_before_pipeline(self):
         for content in (b"", b"not a PDF", b"%PDF-1.7\nbroken body"):
             with self.subTest(content=content), patch("AI.main.doc_pipeline") as run:
-                response = self.client.post("/api/v1/invoices/extract", files={"file": ("invoice.pdf", content)})
+                response = self.client.post("/api/v1/invoices/extract?wait=true", files={"file": ("invoice.pdf", content)})
                 self.assertEqual(response.status_code, 422, response.text)
                 run.assert_not_called()
 
     def test_encrypted_pdf_is_rejected(self):
         with patch("AI.main.doc_pipeline") as run:
-            response = self.client.post("/api/v1/invoices/extract", files={"file": ("invoice.pdf", pdf_bytes(True))})
+            response = self.client.post("/api/v1/invoices/extract?wait=true", files={"file": ("invoice.pdf", pdf_bytes(True))})
         self.assertEqual(response.status_code, 422)
         self.assertIn("Password", response.json()["detail"])
         run.assert_not_called()
 
     def test_oversized_file_is_rejected(self):
         with patch.dict(os.environ, {"INVOICE_MAX_UPLOAD_BYTES": "10"}), patch("AI.main.doc_pipeline") as run:
-            response = self.client.post("/api/v1/invoices/extract", files={"file": ("invoice.pdf", pdf_bytes())})
+            response = self.client.post("/api/v1/invoices/extract?wait=true", files={"file": ("invoice.pdf", pdf_bytes())})
         self.assertEqual(response.status_code, 413)
         run.assert_not_called()
 
@@ -135,14 +135,14 @@ class InvoiceUploadTests(TestCase):
             raise RuntimeError("private failure details")
 
         with patch("AI.main.doc_pipeline", side_effect=fail), self.assertLogs("server.routes.invoices", level="ERROR"):
-            response = self.client.post("/api/v1/invoices/extract", files={"file": ("invoice.pdf", pdf_bytes())})
+            response = self.client.post("/api/v1/invoices/extract?wait=true", files={"file": ("invoice.pdf", pdf_bytes())})
         self.assertEqual(response.status_code, 502)
         self.assertNotIn("private failure details", response.text)
         self.assertFalse(captured["directory"].exists())
 
     def test_invalid_ai_response_returns_502(self):
         with patch("AI.main.doc_pipeline", return_value={"invoices": []}), self.assertLogs("server.routes.invoices", level="ERROR"):
-            response = self.client.post("/api/v1/invoices/extract", files={"file": ("invoice.pdf", pdf_bytes())})
+            response = self.client.post("/api/v1/invoices/extract?wait=true", files={"file": ("invoice.pdf", pdf_bytes())})
         self.assertEqual(response.status_code, 502)
 
     def test_openapi_and_existing_routes(self):
