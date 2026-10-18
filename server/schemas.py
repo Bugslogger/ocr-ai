@@ -55,3 +55,8 @@ class ExtractedInvoice(BaseModel):
 
 class InvoiceExtractionResponse(BaseModel):
     invoices: list[ExtractedInvoice] = Field(min_length=1)
+
+
+class InvoiceSocketUpload(BaseModel):
+    filename: str = Field(min_length=1)
+    size: int = Field(strict=True, gt=0, description="PDF file size in bytes")

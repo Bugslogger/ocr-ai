@@ -1,7 +1,7 @@
 """Upload validation and the adapter to the complete AI invoice pipeline."""
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Callable
 import os
 
 
@@ -18,12 +18,22 @@ class InvoiceTooLargeError(ValueError):
 
 
 class InvoiceProcessor:
-    def process(self, stream: BinaryIO, filename: str | None) -> dict[str, Any]:
+    @staticmethod
+    def validate_filename(filename: str | None) -> None:
         if not filename or Path(filename).suffix.lower() != ".pdf":
             raise UnsupportedInvoiceError("Upload an invoice with a .pdf filename")
+
+    @staticmethod
+    def upload_limit() -> int:
         max_bytes = int(os.getenv("INVOICE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
         if max_bytes <= 0:
             raise RuntimeError("INVOICE_MAX_UPLOAD_BYTES must be positive")
+        return max_bytes
+
+    def process(self, stream: BinaryIO, filename: str | None,
+                progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+        self.validate_filename(filename)
+        max_bytes = self.upload_limit()
         backend = os.getenv("INVOICE_TARIFF_BACKEND", "weaviate")
         if backend not in {"catalog", "weaviate"}:
             raise RuntimeError("INVOICE_TARIFF_BACKEND must be catalog or weaviate")
@@ -46,7 +56,10 @@ class InvoiceProcessor:
             # Lazy import: server startup and rejected uploads load no AI models.
             from AI.main import doc_pipeline
 
-            return doc_pipeline(pdf, Path(folder) / "output", backend=backend)
+            options = {"backend": backend}
+            if progress is not None:
+                options["progress"] = progress
+            return doc_pipeline(pdf, Path(folder) / "output", **options)
 
     @staticmethod
     def _validate_pdf(path: Path) -> None:

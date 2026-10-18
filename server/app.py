@@ -12,6 +12,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
 
 from server.api.rest import router as rest_router
 from server.api.websocket import router as websocket_router
+from server.api.invoice_websocket import router as invoice_websocket_router
 from server.routes.models import router as models_router
 from server.routes.invoices import router as invoices_router
 
@@ -22,6 +23,7 @@ def create_app() -> FastAPI:
     app.include_router(models_router, prefix="/api/v1")
     app.include_router(invoices_router, prefix="/api/v1")
     app.include_router(websocket_router, prefix="/ws")
+    app.include_router(invoice_websocket_router, prefix="/ws")
     return app
 
 
