@@ -28,6 +28,20 @@ class GPURequest(BaseModel):
     interval: float = Field(default=2, ge=1, le=60)
 
 
+class EventValidationError(ValueError):
+    def __init__(self, errors):
+        self.errors = [{"field": ".".join(map(str, error["loc"])) or "payload",
+                        "message": error["msg"]} for error in errors]
+
+
+def parse_request(model, data):
+    """Accept Socket.IO JSON objects and JSON text sent by clients like Postman."""
+    try:
+        return model.model_validate_json(data) if isinstance(data, str) else model.model_validate(data)
+    except ValidationError as exc:
+        raise EventValidationError(exc.errors(include_input=False, include_url=False)) from exc
+
+
 class InvoiceSocketIO:
     def __init__(self, jobs=None, gpu=None):
         self.jobs = jobs if jobs is not None else invoice_jobs
@@ -56,8 +70,13 @@ class InvoiceSocketIO:
             self.sio.on(event, self.guarded(event, handler))
 
     def guarded(self, event, handler):
-        async def receive(sid, data=None):
+        async def receive(sid, data=None, *extra):
             try:
+                if extra:
+                    error = {"ok": False, "event": event, "status": 422,
+                             "detail": "Send one JSON object argument only; remove extra arguments in Postman."}
+                    await self.emit(sid, "request:error", error)
+                    return error
                 return await handler(sid, data)
             except FileNotFoundError:
                 status, detail = 404, "Invoice job not found"
@@ -65,8 +84,16 @@ class InvoiceSocketIO:
                 status, detail = 413, str(exc)
             except UnsupportedInvoiceError as exc:
                 status, detail = 415, str(exc)
-            except (InvalidInvoiceError, ValidationError):
-                status, detail = 422, "Invalid event data or unreadable invoice PDF"
+            except EventValidationError as exc:
+                detail = ("Invoice job events require job_id (32 lowercase hexadecimal characters) and optional interval (1–60 seconds)."
+                          if event.startswith("invoice:") else "GPU interval must be between 1 and 60 seconds.")
+                error = {"ok": False, "event": event, "status": 422,
+                         "detail": "Invalid event data. " + detail,
+                         "errors": exc.errors}
+                await self.emit(sid, "request:error", error)
+                return error
+            except InvalidInvoiceError as exc:
+                status, detail = 422, str(exc)
             except Exception:
                 logger.exception("Socket.IO event %s failed", event)
                 status, detail = 502, "Request failed. Check server logs for details."
@@ -80,6 +107,8 @@ class InvoiceSocketIO:
         if session:
             async with session["emit_lock"]:
                 await self.sio.emit(event, data, to=sid)
+                return True
+        return False
 
     async def connect(self, sid, environ, auth=None):
         self.sessions[sid] = {"tasks": {}, "emit_lock": asyncio.Lock()}
@@ -126,6 +155,15 @@ class InvoiceSocketIO:
             await self.disconnect(sid)
         await self.sio.shutdown()
 
+    async def cleanup_delivered(self, job_id):
+        cleanup = asyncio.create_task(run_in_threadpool(self.jobs.cleanup_delivered, job_id))
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # A disconnect immediately after delivery must still finish cleanup.
+            await cleanup
+            raise
+
     async def submit(self, sid, data):
         if not isinstance(data, dict) or not isinstance(data.get("filename"), str):
             raise InvalidInvoiceError("Provide filename and binary pdf")
@@ -142,36 +180,66 @@ class InvoiceSocketIO:
         return payload
 
     async def get(self, sid, data):
-        request = JobRequest.model_validate(data)
+        request = parse_request(JobRequest, data)
         job = await run_in_threadpool(self.jobs.get, request.job_id)
         payload = {"ok": True, "job": job.model_dump(mode="json")}
-        await self.emit(sid, "invoice:details", payload)
+        sent = await self.emit(sid, "invoice:details", payload)
+        if sent and job.status == JobStatus.SUCCEEDED:
+            await self.cleanup_delivered(request.job_id)
         return payload
 
     async def subscribe(self, sid, data):
-        request = JobRequest.model_validate(data)
+        request = parse_request(JobRequest, data)
         job = await run_in_threadpool(self.jobs.get, request.job_id)
         await self.start(sid, "invoice:" + request.job_id, self.job_stream, request.job_id, request.interval)
-        return {"ok": True, "job": job.model_dump(mode="json")}
+        payload = {"ok": True, "job": job.model_dump(mode="json"), "interval": request.interval}
+        await self.emit(sid, "invoice:subscribed", payload)
+        return payload
 
     async def unsubscribe(self, sid, data):
-        request = JobRequest.model_validate(data)
+        request = parse_request(JobRequest, data)
         await self.stop(sid, "invoice:" + request.job_id)
         return {"ok": True, "job_id": request.job_id}
 
     async def job_stream(self, sid, job_id, interval):
-        while True:
-            job = await run_in_threadpool(self.jobs.get, job_id)
-            if job.status == JobStatus.SUCCEEDED:
-                event = "invoice:completed"
-            elif job.status == JobStatus.FAILED:
-                event = "invoice:failed"
-            else:
-                event = "invoice:progress"
-            await self.emit(sid, event, {"job": job.model_dump(mode="json")})
-            if job.status in {JobStatus.SUCCEEDED, JobStatus.FAILED}:
-                return
-            await asyncio.sleep(interval)
+        loop = asyncio.get_running_loop()
+        updates = asyncio.Queue()
+
+        def changed(job):
+            loop.call_soon_threadsafe(updates.put_nowait, job)
+
+        previous = None
+        latest_time = None
+        try:
+            registration = asyncio.create_task(run_in_threadpool(self.jobs.subscribe, job_id, changed))
+            try:
+                job = await asyncio.shield(registration)
+            except asyncio.CancelledError:
+                # A thread may finish registering after cancellation; detach it below.
+                await registration
+                raise
+            while True:
+                snapshot = job.model_dump(mode="json")
+                # Polling and worker notifications may overlap; never regress.
+                if (latest_time is None or job.updated_at >= latest_time) and snapshot != previous:
+                    event = ("invoice:completed" if job.status == JobStatus.SUCCEEDED else
+                             "invoice:failed" if job.status == JobStatus.FAILED else "invoice:progress")
+                    sent = await self.emit(sid, event, {"job": snapshot})
+                    if not sent:
+                        return
+                    previous, latest_time = snapshot, job.updated_at
+                    if job.status == JobStatus.SUCCEEDED:
+                        await self.cleanup_delivered(job_id)
+                    if job.status in {JobStatus.SUCCEEDED, JobStatus.FAILED}:
+                        return
+                try:
+                    job = await asyncio.wait_for(updates.get(), timeout=interval)
+                except asyncio.TimeoutError:
+                    # Covers queue-position changes and jobs owned by another process.
+                    job = await run_in_threadpool(self.jobs.get, job_id)
+        finally:
+            # Synchronous and short: always detach, including during cancellation.
+            self.jobs.unsubscribe(job_id, changed)
 
     async def gpu_get(self, sid, data=None):
         snapshot = await run_in_threadpool(self.gpu.snapshot)
@@ -180,7 +248,7 @@ class InvoiceSocketIO:
         return payload
 
     async def gpu_subscribe(self, sid, data=None):
-        request = GPURequest.model_validate(data if data is not None else {})
+        request = parse_request(GPURequest, data if data is not None else {})
         await self.start(sid, "gpu", self.gpu_stream, request.interval)
         return {"ok": True, "interval": request.interval}
 

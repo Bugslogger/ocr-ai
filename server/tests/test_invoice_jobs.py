@@ -4,11 +4,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
 from unittest import TestCase, main
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 import json
 import os
 import time
+import asyncio
 
 from fastapi.testclient import TestClient
 
@@ -111,6 +112,78 @@ class InvoiceJobTests(TestCase):
                 if job_id:
                     self.terminal(job_id)
         self.assertEqual(self.client.get(response.headers["location"]).json()["result"], extracted_result())
+
+    def test_final_http_response_removes_only_delivered_job_files(self):
+        with patch("AI.main.doc_pipeline", return_value=extracted_result()):
+            first = self.submit().json()["job_id"]
+            second = self.submit().json()["job_id"]
+            self.terminal(first)
+            self.terminal(second)
+        first_folder = Path(self.directory.name) / first
+        second_folder = Path(self.directory.name) / second
+        self.assertTrue((first_folder / "job.json").exists())
+        (first_folder / "extra-artifact.txt").write_text("private invoice data")
+        response = self.client.get(f"/api/v1/invoices/jobs/{first}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["result"], extracted_result())
+        self.assertFalse(first_folder.exists())
+        self.assertTrue((second_folder / "job.json").exists())
+        # Current-process reconnects work without recreating files on disk.
+        self.assertEqual(self.client.get(f"/api/v1/invoices/jobs/{first}").json()["result"], extracted_result())
+        self.assertFalse(first_folder.exists())
+        with self.assertRaises(FileNotFoundError):
+            InvoiceJobService(root=self.directory.name).get(first)
+
+    def test_cleanup_keeps_processing_and_failed_jobs(self):
+        started, release = Event(), Event()
+
+        def pipeline(*args, **options):
+            started.set()
+            if not release.wait(5):
+                raise RuntimeError("Inference not released")
+            raise RuntimeError("Extraction failed")
+
+        with patch("AI.main.doc_pipeline", side_effect=pipeline), self.assertLogs(
+            "server.services.invoice_jobs", level="ERROR"
+        ):
+            job_id = self.submit().json()["job_id"]
+            folder = Path(self.directory.name) / job_id
+            try:
+                self.assertTrue(started.wait(2))
+                self.service.cleanup_delivered(job_id)
+                self.assertTrue((folder / "invoice.pdf").exists())
+            finally:
+                release.set()
+                self.terminal(job_id)
+            self.service.cleanup_delivered(job_id)
+            self.assertTrue((folder / "job.json").exists())
+            self.assertEqual(self.client.get(f"/api/v1/invoices/jobs/{job_id}").json()["status"], "failed")
+            self.assertTrue((folder / "job.json").exists())
+
+    def test_failed_websocket_send_preserves_result_for_retry(self):
+        from server.api.invoice_job_websocket import invoice_job_events
+
+        with patch("AI.main.doc_pipeline", return_value=extracted_result()):
+            job_id = self.submit().json()["job_id"]
+            self.terminal(job_id)
+        socket = AsyncMock()
+        socket.send_json.side_effect = OSError("Disconnected before final result")
+        asyncio.run(invoice_job_events(socket, job_id))
+        self.assertTrue((Path(self.directory.name) / job_id / "job.json").exists())
+        self.assertEqual(self.service.get(job_id).result.model_dump(), extracted_result())
+
+    def test_cleanup_failure_keeps_result_readable_and_can_retry(self):
+        with patch("AI.main.doc_pipeline", return_value=extracted_result()):
+            job_id = self.submit().json()["job_id"]
+            self.terminal(job_id)
+        with patch("server.services.invoice_jobs.shutil.rmtree", side_effect=OSError("Busy")), self.assertLogs(
+            "server.services.invoice_jobs", level="ERROR"
+        ):
+            self.service.cleanup_delivered(job_id)
+        self.assertEqual(self.service.get(job_id).result.model_dump(), extracted_result())
+        self.service.cleanup_delivered(job_id)
+        self.service.cleanup_delivered(job_id)
+        self.assertFalse((Path(self.directory.name) / job_id).exists())
 
     def test_extract_default_validates_before_acceptance(self):
         for filename, content, status in [("invoice.txt", b"text", 415), ("invoice.pdf", b"broken", 422)]:
@@ -237,6 +310,7 @@ class InvoiceJobTests(TestCase):
             message = socket.receive_json()
             self.assertEqual(message["event"], "completed")
             self.assertEqual(message["job"]["progress_percent"], 100)
+        self.assertFalse((Path(self.directory.name) / job_id).exists())
 
     def test_socket_disconnect_leaves_job_running_and_can_reconnect(self):
         started, release = Event(), Event()

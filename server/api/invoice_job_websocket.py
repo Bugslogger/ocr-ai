@@ -32,6 +32,8 @@ async def invoice_job_events(
             terminal = job.status in {JobStatus.SUCCEEDED, JobStatus.FAILED}
             event = ("completed" if job.status == JobStatus.SUCCEEDED else "failed") if terminal else "progress"
             await websocket.send_json({"event": event, "job": job.model_dump(mode="json")})
+            if job.status == JobStatus.SUCCEEDED:
+                await run_in_threadpool(invoice_jobs.cleanup_delivered, job_id)
             if terminal:
                 await websocket.close(code=1000)
                 return

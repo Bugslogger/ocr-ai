@@ -1,16 +1,21 @@
 """Exercise Engine.IO/Socket.IO wire protocol through the real ASGI mount."""
 from contextlib import contextmanager
 from pathlib import Path
+from io import BytesIO
+from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
 from threading import Event
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 import json
 import time
+import asyncio
 
 from fastapi.testclient import TestClient
 
 from server.app import create_app
+from server.api.socketio import InvoiceSocketIO
+from server.schemas import InvoiceJobResponse
 from server.services.invoice_jobs import InvoiceJobService
 from server.tests.test_invoices import pdf_bytes, extracted_result
 
@@ -107,6 +112,7 @@ class SocketIOTests(TestCase):
                     # Terminal invoice events leave the connection available for GPU events.
                     self.send(ws, "gpu:get", {})
                     self.assertTrue(self.event(ws, "gpu:status")["data"]["available"])
+                self.assertFalse((Path(self.directory.name) / job_id).exists())
             finally:
                 release.set()
                 if job_id:
@@ -126,6 +132,34 @@ class SocketIOTests(TestCase):
             self.send(ws, "gpu:get", {})
             self.assertTrue(self.event(ws, "gpu:status")["ok"])
 
+    def test_final_lookup_cleans_files_and_disconnected_lookup_keeps_them(self):
+        with patch("AI.main.doc_pipeline", return_value=extracted_result()):
+            from io import BytesIO
+            job = self.jobs.create(BytesIO(pdf_bytes()), "invoice.pdf")
+            self.terminal(job.job_id)
+        folder = Path(self.directory.name) / job.job_id
+        asyncio.run(self.transport.get("disconnected-client", {"job_id": job.job_id}))
+        self.assertTrue((folder / "job.json").exists())
+        with self.connection() as ws:
+            self.send(ws, "invoice:get", {"job_id": job.job_id})
+            self.assertEqual(self.event(ws, "invoice:details")["job"]["result"], extracted_result())
+            self.send(ws, "gpu:get", {})
+            self.event(ws, "gpu:status")
+        self.assertFalse(folder.exists())
+
+    def test_extra_arguments_return_error_and_ack_without_closing_connection(self):
+        with self.connection() as ws:
+            ws.send_text('421["invoice:subscribe",{"job_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{}]')
+            error = self.event(ws, "request:error")
+            self.assertEqual(error["status"], 422)
+            self.assertEqual(error["event"], "invoice:subscribe")
+            self.assertIn("one JSON object", error["detail"])
+            packet = ws.receive_text()
+            self.assertTrue(packet.startswith("431"), packet)
+            self.assertEqual(json.loads(packet[3:]), [error])
+            self.send(ws, "gpu:get", {})
+            self.assertTrue(self.event(ws, "gpu:status")["ok"])
+
     def test_acknowledgement_and_unsubscribe(self):
         with self.connection() as ws:
             ws.send_text('421["gpu:subscribe",{"interval":1}]')
@@ -141,3 +175,121 @@ class SocketIOTests(TestCase):
                     self.assertTrue(json.loads(packet[3:])[0]["ok"])
                     break
             self.assertTrue(all(not session["tasks"] for session in self.transport.sessions.values()))
+
+    def test_subscribe_accepts_objects_and_json_text(self):
+        for as_text in (False, True):
+            with self.subTest(as_text=as_text), patch("AI.main.doc_pipeline", return_value=extracted_result()):
+                job = self.jobs.create(BytesIO(pdf_bytes()), "invoice.pdf")
+                self.terminal(job.job_id)
+                with self.connection() as ws:
+                    payload = {"job_id": job.job_id, "interval": 2}
+                    self.send(ws, "invoice:subscribe", json.dumps(payload) if as_text else payload)
+                    subscribed = self.event(ws, "invoice:subscribed")
+                    self.assertTrue(subscribed["ok"])
+                    self.assertEqual(subscribed["interval"], 2)
+                    self.assertEqual(subscribed["job"]["job_id"], job.job_id)
+                    self.assertEqual(self.event(ws, "invoice:completed")["job"]["result"], extracted_result())
+
+    def test_subscription_validation_identifies_invalid_fields(self):
+        with self.connection() as ws:
+            for payload, field in [({}, "job_id"), ({"job_id": "short"}, "job_id"),
+                                   ({"job_id": "a" * 32, "interval": 0}, "interval"),
+                                   ("{invalid json", "payload")]:
+                self.send(ws, "invoice:subscribe", payload)
+                error = self.event(ws, "request:error")
+                self.assertEqual(error["status"], 422)
+                self.assertEqual(error["errors"][0]["field"], field)
+                self.assertNotIn("PDF", error["detail"])
+            self.send(ws, "gpu:get", {})
+            self.assertTrue(self.event(ws, "gpu:status")["ok"])
+
+    def test_invalid_stored_job_is_server_error_not_payload_error(self):
+        try:
+            InvoiceJobResponse.model_validate({})
+        except Exception as exc:
+            invalid_job = exc
+        with patch.object(self.jobs, "get", side_effect=invalid_job), self.assertLogs(
+            "server.api.socketio", level="ERROR"
+        ), self.connection() as ws:
+            self.send(ws, "invoice:subscribe", {"job_id": "a" * 32, "interval": 2})
+            self.assertEqual(self.event(ws, "request:error")["status"], 502)
+
+    def test_stage_updates_push_without_waiting_for_poll_interval(self):
+        started, advance, finish = Event(), Event(), Event()
+
+        def pipeline(*args, **options):
+            options["progress"]("running_ocr")
+            started.set()
+            if not advance.wait(5):
+                raise RuntimeError("Stage change not released")
+            options["progress"]("cleaning_text")
+            options["progress"]("extracting_json")
+            if not finish.wait(5):
+                raise RuntimeError("Completion not released")
+            return extracted_result()
+
+        async def watch(job_id):
+            transport = InvoiceSocketIO(jobs=self.jobs)
+            stages = []
+            initial, updated, completed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+            async def emitted(sid, event, payload):
+                if event == "invoice:progress":
+                    stages.append(payload["job"]["stage"])
+                    initial.set()
+                    if len(stages) == 3:
+                        updated.set()
+                elif event == "invoice:completed":
+                    completed.set()
+                return True
+
+            transport.emit = AsyncMock(side_effect=emitted)
+            await transport.connect("test", {})
+            try:
+                await transport.subscribe("test", {"job_id": job_id, "interval": 60})
+                await asyncio.wait_for(initial.wait(), timeout=2)
+                advance.set()
+                await asyncio.wait_for(updated.wait(), timeout=2)
+                self.assertEqual(stages, ["running_ocr", "cleaning_text", "extracting_json"])
+                finish.set()
+                await asyncio.wait_for(completed.wait(), timeout=2)
+            finally:
+                await transport.close()
+            self.assertEqual(self.jobs._subscribers, {})
+
+        with patch("AI.main.doc_pipeline", side_effect=pipeline):
+            job_id = self.jobs.create(BytesIO(pdf_bytes()), "invoice.pdf").job_id
+            try:
+                self.assertTrue(started.wait(2))
+                asyncio.run(watch(job_id))
+                self.assertFalse((Path(self.directory.name) / job_id).exists())
+            finally:
+                advance.set()
+                finish.set()
+                self.terminal(job_id)
+
+    def test_backend_polling_detects_changes_and_suppresses_duplicate_snapshots(self):
+        now = datetime.now(timezone.utc)
+        initial = InvoiceJobResponse(job_id="a" * 32, status="queued", stage="queued",
+                                     filename="invoice.pdf", created_at=now, updated_at=now)
+        final = initial.model_copy(update={"status": "succeeded", "stage": "completed",
+                                           "progress_percent": 100})
+        jobs = Mock(spec=InvoiceJobService)
+        jobs.subscribe.return_value = initial
+        # No local notification: polling first sees unchanged data, then completion.
+        jobs.get.side_effect = [initial, final]
+        transport = InvoiceSocketIO(jobs=jobs)
+        transport.emit = AsyncMock(return_value=True)
+
+        async def watch():
+            try:
+                await asyncio.wait_for(transport.job_stream("test", initial.job_id, .01), timeout=2)
+            finally:
+                await transport.close()
+
+        asyncio.run(watch())
+        self.assertEqual([call.args[1] for call in transport.emit.await_args_list],
+                         ["invoice:progress", "invoice:completed"])
+        self.assertEqual(jobs.get.call_count, 2)
+        jobs.unsubscribe.assert_called_once()
+        jobs.cleanup_delivered.assert_called_once_with(initial.job_id)

@@ -1,4 +1,4 @@
-"""Background full-pipeline jobs with atomically persisted status and results."""
+"""Background invoice jobs persisted until successful result delivery."""
 from datetime import datetime, timezone
 from pathlib import Path
 from queue import Queue
@@ -41,6 +41,8 @@ class InvoiceJobService:
         self._pending = []
         self._lock = RLock()
         self._worker = None
+        self._delivered = {}
+        self._subscribers = {}
 
     def _path(self, job_id):
         if not re.fullmatch(r"[0-9a-f]{32}", job_id):
@@ -72,6 +74,28 @@ class InvoiceJobService:
                 changes.update(progress_percent=100, stage_description="Invoice processing completed")
             data.update(changes, updated_at=datetime.now(timezone.utc).isoformat())
             self._save(job_id, data)
+            if self._subscribers.get(job_id):
+                job = self.get(job_id)
+                for callback in tuple(self._subscribers[job_id]):
+                    try:
+                        callback(job.model_copy(deep=True))
+                    except Exception:
+                        logger.exception("Could not notify subscriber for invoice job %s", job_id)
+
+    def subscribe(self, job_id, callback):
+        """Atomically register a nonblocking callback and return the current state."""
+        with self._lock:
+            job = self.get(job_id)
+            self._subscribers.setdefault(job_id, set()).add(callback)
+            return job
+
+    def unsubscribe(self, job_id, callback):
+        with self._lock:
+            subscribers = self._subscribers.get(job_id)
+            if subscribers:
+                subscribers.discard(callback)
+                if not subscribers:
+                    self._subscribers.pop(job_id, None)
 
     def create(self, stream, filename):
         self.processor.validate_filename(filename)
@@ -117,6 +141,8 @@ class InvoiceJobService:
 
     def get(self, job_id):
         with self._lock:
+            if job_id in self._delivered:
+                return self._delivered[job_id].model_copy(deep=True)
             data = self._read(job_id)
             if data["status"] in {JobStatus.QUEUED.value, JobStatus.PROCESSING.value} and not self._owner_running(data):
                 (self.root / job_id / "invoice.pdf").unlink(missing_ok=True)
@@ -135,6 +161,27 @@ class InvoiceJobService:
             else:
                 job.queue_position = 0 if job.status == JobStatus.PROCESSING else None
             return job
+
+    def cleanup_delivered(self, job_id):
+        """Remove a successful job's files after its final result has been sent.
+
+        Keep a process-local snapshot so existing subscribers and reconnects can
+        still read the result. Delivered results no longer survive a restart.
+        """
+        with self._lock:
+            try:
+                job = self.get(job_id)
+            except FileNotFoundError:
+                return
+            if job.status != JobStatus.SUCCEEDED:
+                return
+            self._delivered[job_id] = job.model_copy(deep=True)
+            folder = self._path(job_id).parent
+            try:
+                if folder.exists():
+                    shutil.rmtree(folder)
+            except OSError:
+                logger.exception("Could not remove delivered invoice job %s", job_id)
 
     def _work(self):
         while True:

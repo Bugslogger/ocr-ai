@@ -247,6 +247,64 @@ class ExternalBoundaryTests(TestCase):
 
 
 class PipelineTests(TestCase):
+    def test_expanded_order_fields_are_extracted_without_changing_values(self):
+        order = {
+            "company_name": "Acme Corporation",
+            "company_address": "123 Main St, Springfield, IL 62704, United States",
+            "invoice_number": "INV-2026-001", "invoice_date": "2026-05-20",
+            "purchase_order_number": "PO-4789", "currency": "USD",
+            "payment_terms": "Net 30", "inco_terms": "FOB", "tax_id": "ERO/GST/FED",
+            "tracking_number": "1Z999AA10123456784", "shipper_company": "Acme Logistics",
+            "shipper_email": "shipments@acme.com", "shipper_phone_number": "+1 555-0100",
+            "shipper_country": "United States", "shipper_state": "IL",
+            "shipper_city": "Springfield", "shipper_zipcode": "62704",
+            "shipper_address1": "123 Main St", "shipper_address2": "Suite 400",
+            "receiver_company": "Global Imports Ltd", "receiver_firstname": "Jane",
+            "receiver_lastname": "Doe", "receiver_phone_number": "+44 20 7946 0000",
+            "receiver_country": "United Kingdom", "receiver_state": "Greater London",
+            "receiver_city": "London", "receiver_zipcode": "SW1A 1AA",
+            "receiver_address1": "456 Industrial Way", "receiver_address2": "Unit 12",
+            "receiver_email": "jane.doe@globalimports.co.uk", "gross_weight": 420,
+            "net_weight": 400, "package_count": 12, "total_quantity": 50,
+            "total_amount": 12500.0, "shipping_and_handling": None,
+            "total_item_value": None, "dimensions_cm": "40 x 30 x 31",
+            "origin_phone_code": "+1", "destination_phone_code": "+44",
+            "origin_country": "United States", "destination_country": "United Kingdom",
+        }
+        payload = {"invoices": [{**invoice(), "order_level": order}]}
+        generate = Mock(return_value=json.dumps(payload))
+        parsed = format_json(cleaned_text="Invoice", generate=generate)
+        self.assertEqual(parsed["invoices"][0]["order_level"], order)
+        self.assertEqual(list(order), ORDER_FIELDS)
+        # The extraction model receives the expanded contract automatically.
+        system = generate.call_args.args[0][0]["content"]
+        contract = json.loads(system.split("JSON Schema:\n", 1)[1])
+        required = contract["properties"]["invoices"]["items"]["properties"]["order_level"]["required"]
+        self.assertEqual(required, list(order))
+
+    def test_order_numbers_allow_fractions_and_missing_values(self):
+        payload = {"invoices": [invoice()]}
+        payload["invoices"][0]["order_level"].update(
+            gross_weight=420.5, net_weight=400.25, package_count=12,
+            total_quantity=50.5, total_amount=12500.75,
+            shipping_and_handling=10.5, total_item_value=12490.25,
+        )
+        self.assertEqual(format_json(cleaned_text="Invoice", generate=Mock(return_value=json.dumps(payload))), payload)
+        payload["invoices"][0]["order_level"] = {key: None for key in ORDER_FIELDS}
+        self.assertEqual(format_json(cleaned_text="Invoice", generate=Mock(return_value=json.dumps(payload))), payload)
+
+    def test_invalid_order_field_types_fail_extraction(self):
+        for field, value in (("gross_weight", "420"), ("net_weight", "400"),
+                             ("package_count", 1.5), ("total_quantity", "50"),
+                             ("shipping_and_handling", "10"), ("total_item_value", True),
+                             ("dimensions_cm", 40), ("origin_phone_code", 1),
+                             ("receiver_email", 123)):
+            with self.subTest(field=field):
+                payload = {"invoices": [invoice()]}
+                payload["invoices"][0]["order_level"][field] = value
+                with self.assertRaisesRegex(ValueError, "Invalid invoice JSON"):
+                    format_json(cleaned_text="Invoice", generate=Mock(return_value=json.dumps(payload)))
+
     def test_weaviate_connection_closed_if_country_mapping_fails(self):
         with TemporaryDirectory() as folder:
             pdf = Path(folder) / "invoice.pdf"

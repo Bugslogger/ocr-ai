@@ -2,9 +2,9 @@
 from typing import Annotated
 import logging
 
-from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, HTTPException, Query, Response, UploadFile
 
-from server.schemas import InvoiceExtractionResponse, InvoiceJobResponse
+from server.schemas import InvoiceExtractionResponse, InvoiceJobResponse, JobStatus
 from server.services.invoice_jobs import invoice_jobs
 from server.services.invoices import (
     InvoiceProcessor, InvalidInvoiceError, UnsupportedInvoiceError, InvoiceTooLargeError,
@@ -35,10 +35,13 @@ def create_invoice_job(file: Annotated[UploadFile, File(description="Invoice PDF
 
 @router.get("/jobs/{job_id}", response_model=InvoiceJobResponse,
             summary="Get invoice job progress and the final extracted JSON")
-def get_invoice_job(job_id: str, response: Response) -> InvoiceJobResponse:
+def get_invoice_job(job_id: str, response: Response, background_tasks: BackgroundTasks) -> InvoiceJobResponse:
     response.headers["Cache-Control"] = "no-store"
     try:
-        return invoice_jobs.get(job_id)
+        job = invoice_jobs.get(job_id)
+        if job.status == JobStatus.SUCCEEDED:
+            background_tasks.add_task(invoice_jobs.cleanup_delivered, job_id)
+        return job
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Invoice job not found") from exc
 
