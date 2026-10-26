@@ -14,7 +14,7 @@ from AI.main import doc_pipeline
 from AI.schema import ORDER_FIELDS, ITEM_FIELDS, NUMBER_FIELDS
 from AI.tariff import (CatalogRetriever, WeaviateRetriever, classify_item,
                        iso2_from_country, validate_selection)
-from AI.utils import clean_ocr_text, extract_doc, format_json, qwen_generate
+from AI.utils import clean_ocr_text, extract_doc, format_json, qwen_generate, _ocr_call, pdf_to_images
 
 
 def invoice(sku="DUPLICATE"):
@@ -97,6 +97,53 @@ class CountryMapTests(TestCase):
 
 
 class TariffTests(TestCase):
+    def test_three_country_invoice_uses_manufacturing_origin_not_export(self):
+        inv = invoice()
+        inv["order_level"].update(origin_country="United Kingdom", shipper_country="United Kingdom",
+                                  destination_country="Australia", receiver_country="Australia")
+        item = inv["item_level"][0]
+        item["country_of_manufacture"] = "China"
+        overlay = [{**NATIONAL[0], "jurisdiction": iso} for iso in ("CN", "GB", "AU")]
+        matches = CatalogRetriever(ROWS, overlay).retrieve(item, inv["order_level"])
+        self.assertEqual(matches["origin_iso"], "CN")
+        self.assertEqual(matches["destination_iso"], "AU")
+        self.assertEqual({row["jurisdiction"] for row in matches["origin_candidates"]}, {"CN"})
+        item["country_of_manufacture"] = None
+        matches = CatalogRetriever(ROWS, overlay).retrieve(item, inv["order_level"])
+        self.assertIsNone(matches["origin_iso"])
+        self.assertEqual(matches["origin_candidates"], [])
+
+    def test_nz_check_letter_is_validated_by_country_and_exact_membership(self):
+        rows = [{"jurisdiction": "NZ", "hs6": "320190", "national_code": "3201900011G"}]
+        candidates = [{"hs_code": "320190"}]
+        result = validate_selection({"hs6": "320190", "destination_national_code": "3201.90.0011g"},
+                                    "SKU", candidates, rows, [])
+        self.assertEqual(result[:3], ("320190", "3201900011G", None))
+        wrong_letter = validate_selection({"hs6": "320190", "destination_national_code": "3201900011H"},
+                                         "SKU", candidates, rows, [])
+        self.assertIsNone(wrong_letter[1])
+        wrong_country = validate_selection({"hs6": "320190", "destination_national_code": "3201900011G"},
+                                          "SKU", candidates, [{**rows[0], "jurisdiction": "AU"}], [])
+        self.assertIsNone(wrong_country[1])
+
+    def test_rejected_hs6_does_not_keep_model_success_explanation(self):
+        inv = invoice()
+        item = inv["item_level"][0]
+        item.update(hs_code="3201", product_description="UV printing ink")
+        matches = {"hs_candidates": [{"hs_code": "320110", "description": "Quebracho extract"}],
+                   "origin_candidates": [{"jurisdiction": "AU", "hs6": "960810", "national_code": "9608100000"}],
+                   "destination_candidates": [], "origin_iso": "AU", "destination_iso": "NZ", "source": "test"}
+        generate = Mock(return_value=json.dumps({"hs6": "960810", "confidence": "MEDIUM", "needs_review": False,
+                                                "classification_reason": "The product matches disposable liquid ink"}))
+        result = classify_item(item, inv["order_level"], matches, generate)
+        self.assertEqual(result["hs_code"], "3201")
+        self.assertIsNone(result["hs6_code"])
+        self.assertEqual(result["confidence"], "LOW")
+        self.assertIn("rejected", result["classification_reason"])
+        self.assertNotIn("product matches", result["classification_reason"])
+        prompt = json.loads(generate.call_args.args[0][1]["content"])
+        self.assertEqual(prompt["origin_candidates"], [])
+
     def test_country_lookup_is_exact(self):
         for value, expected in [("Finland", "FI"), ("Dominican Republic", "DO"),
                                 ("USA", "US"), ("AU", "AU"), ("zzz", None), (None, None)]:
@@ -145,6 +192,7 @@ class TariffTests(TestCase):
         generate = Mock(return_value=json.dumps({"hs6": "854442", "needs_review": False, "confidence": "HIGH"}))
         result = classify_item(inv["item_level"][0], inv["order_level"], matches, generate)
         self.assertEqual(result["hs_code"], "854442")
+        self.assertEqual(result["hs6_code"], "854442")
         self.assertIsNone(result["destination_country_hts_code"])
         self.assertTrue(result["needs_review"])
         self.assertEqual(result["confidence"], "MEDIUM")
@@ -172,9 +220,76 @@ class TariffTests(TestCase):
         item["hs_code"] = "8544.49"
         matches = CatalogRetriever(ROWS).retrieve(item, inv["order_level"])
         result = classify_item(item, inv["order_level"], matches, Mock(return_value='{"hs6":"854442","needs_review":false,"confidence":"MEDIUM"}'))
-        self.assertEqual(result["hs_code"], "8544.49")
+        self.assertEqual(result["hs_code"], "854449")
         self.assertEqual(result["invoice_tariff_codes"]["hs_code"], "8544.49")
         self.assertTrue(result["needs_review"])
+
+    def test_invoice_hs_is_four_or_six_digits_with_original_evidence(self):
+        inv = invoice()
+        item = inv["item_level"][0]
+        matches = CatalogRetriever(ROWS).retrieve(item, inv["order_level"])
+        for printed, heading in [("8708299000", "870829"), ("0101.21.0000", "010121"),
+                                 ("8544", "8544"), ("854442", "854442")]:
+            with self.subTest(printed=printed):
+                item["hs_code"] = printed
+                result = classify_item(item, inv["order_level"], matches, Mock(return_value="invalid"))
+                self.assertEqual(result["hs_code"], heading)
+                self.assertEqual(result["invoice_tariff_codes"]["hs_code"], printed)
+
+    def test_invoice_origin_hts_wins_even_when_model_fails_or_disagrees(self):
+        inv = invoice()
+        item = inv["item_level"][0]
+        item["manufacturing_country_hts_code"] = "8544.49.0000"
+        overlay = [{**NATIONAL[0], "jurisdiction": "FI"}]
+        matches = CatalogRetriever(ROWS, overlay).retrieve(item, inv["order_level"])
+        for response in ["invalid", json.dumps({"hs6": "854442", "origin_national_code": "8544.42.00.00",
+                                               "needs_review": False, "confidence": "HIGH"})]:
+            with self.subTest(response=response):
+                result = classify_item(item, inv["order_level"], matches, Mock(return_value=response))
+                self.assertEqual(result["manufacturing_country_hts_code"], "8544.49.0000")
+                self.assertEqual(result["manufacturing_country_hts_source"], "invoice")
+                self.assertTrue(result["needs_review"])
+                if result["hs6_code"]:
+                    self.assertIn("invoice manufacturing-country HTS conflicts", result["validation_note"])
+
+    def test_missing_or_invalid_origin_hts_uses_validated_country_candidate(self):
+        inv = invoice()
+        item = inv["item_level"][0]
+        matches = CatalogRetriever(ROWS, [{**NATIONAL[0], "jurisdiction": "FI"}]).retrieve(item, inv["order_level"])
+        response = json.dumps({"hs6": "854442", "origin_national_code": "8544.42.00.00",
+                               "needs_review": False, "confidence": "MEDIUM"})
+        for value in [None, "UNITED KINGDOM", "GB", "8544", item["sku_code"]]:
+            with self.subTest(value=value):
+                item["manufacturing_country_hts_code"] = value
+                result = classify_item(item, inv["order_level"], matches, Mock(return_value=response))
+                self.assertEqual(result["manufacturing_country_hts_code"], "8544.42.00.00")
+                self.assertEqual(result["manufacturing_country_hts_source"], matches["source"])
+
+    def test_invalid_origin_evidence_and_rejected_candidate_leave_null(self):
+        inv = invoice()
+        item = inv["item_level"][0]
+        item["manufacturing_country_hts_code"] = "UNITED KINGDOM"
+        matches = CatalogRetriever(ROWS).retrieve(item, inv["order_level"])
+        response = json.dumps({"hs6": "854442", "origin_national_code": "7616999001",
+                               "needs_review": False, "confidence": "MEDIUM"})
+        result = classify_item(item, inv["order_level"], matches, Mock(return_value=response))
+        self.assertIsNone(result["manufacturing_country_hts_code"])
+        self.assertIsNone(result["manufacturing_country_hts_source"])
+        self.assertTrue(result["needs_review"])
+
+    def test_invoice_hs_prevents_unrelated_origin_fallback(self):
+        inv = invoice()
+        item = inv["item_level"][0]
+        item.update(hs_code="8708299000", manufacturing_country_hts_code="UNITED KINGDOM")
+        matches = CatalogRetriever(ROWS, [{**NATIONAL[0], "jurisdiction": "FI"}]).retrieve(item, inv["order_level"])
+        generate = Mock(return_value=json.dumps({"hs6": "854442", "origin_national_code": "8544.42.00.00",
+                                                 "needs_review": False, "confidence": "HIGH"}))
+        result = classify_item(item, inv["order_level"], matches, generate)
+        generate.assert_not_called()
+        self.assertEqual(result["hs_code"], "870829")
+        self.assertIsNone(result["hs6_code"])
+        self.assertIsNone(result["manufacturing_country_hts_code"])
+        self.assertIn("No retrieved HS6 matches", result["validation_note"])
 
     def test_same_country_retrieved_for_both_roles(self):
         inv = invoice()
@@ -185,16 +300,90 @@ class TariffTests(TestCase):
 
 
 class ExternalBoundaryTests(TestCase):
+    def test_weaviate_three_countries_queries_product_origin_and_destination_only(self):
+        query = Mock()
+        query.bm25.return_value.objects = []
+        query.fetch_objects.return_value.objects = []
+        client = Mock()
+        client.collections.get.return_value.query = query
+        matches = WeaviateRetriever(client, {"CN": "41", "GB": "225", "AU": "14"}).retrieve(
+            {"product_description": "Electric cable", "country_of_manufacture": "China", "hs_code": "8544"},
+            {"origin_country": "United Kingdom", "shipper_country": "United Kingdom", "destination_country": "Australia"})
+        self.assertEqual(matches["origin_iso"], "CN")
+        self.assertEqual({call.kwargs["filters"].value for call in query.bm25.call_args_list}, {"41", "14"})
+        self.assertEqual({call.kwargs["filters"].filters[0].value for call in query.fetch_objects.call_args_list}, {"41", "14"})
+
+    def test_ocr_generation_supplies_mask_pad_and_respects_configured_limit(self):
+        import torch
+
+        class Model:
+            config = SimpleNamespace(sliding_window=128)
+            def generate(self, **options):
+                self.options = options
+                return "generated"
+            def infer(self, tokenizer):
+                return self.generate(input_ids=torch.tensor([[0, 1, 7]]), max_length=15000)
+        model = Model()
+        tokenizer = SimpleNamespace(pad_token_id=None, eos_token_id=1)
+        self.assertEqual(_ocr_call(model, model.infer, tokenizer), "generated")
+        self.assertEqual(model.options["attention_mask"].tolist(), [[1, 1, 1]])
+        self.assertEqual(model.options["pad_token_id"], 1)
+        self.assertIsNone(model.options["max_new_tokens"])
+        self.assertEqual(model.options["max_length"], 15000)
+        self.assertNotIn("generate", vars(model))
+
+    def test_ocr_generate_method_is_restored_after_exception(self):
+        class Model:
+            config = SimpleNamespace(sliding_window=128)
+            def generate(self, **options):
+                raise RuntimeError("Generation failed")
+            def infer(self, tokenizer):
+                self.config.sliding_window = None
+                self.config._ring_window = 128
+                return self.generate(max_length=10)
+        model = Model()
+        with self.assertRaisesRegex(RuntimeError, "Generation failed"):
+            _ocr_call(model, model.infer, SimpleNamespace(eos_token_id=1))
+        self.assertNotIn("generate", vars(model))
+        self.assertEqual(model.config.sliding_window, 128)
+        self.assertFalse(hasattr(model.config, "_ring_window"))
+
+    def test_nz_database_rows_keep_check_letters_and_parent_context(self):
+        query = Mock()
+        query.bm25.return_value.objects = []
+        query.fetch_objects.return_value.objects = [
+            SimpleNamespace(uuid="parent", properties={"code": "3201", "description": "Vegetable tanning extracts", "is_leaf": False}),
+            SimpleNamespace(uuid="national", properties={"code": "3201900011G", "description": "Other", "is_leaf": True}),
+            SimpleNamespace(uuid="sku", properties={"code": "PART3201900011G", "description": "Invalid"}),
+        ]
+        client = Mock()
+        client.collections.get.return_value.query = query
+        matches = WeaviateRetriever(client, {"NZ": "156"}).retrieve(
+            {"hs_code": "3201", "country_of_manufacture": "NZ"}, {"receiver_country": "NZ"})
+        self.assertEqual(matches["origin_candidates"][0]["national_code"], "3201900011G")
+        self.assertEqual(len(matches["origin_candidates"]), 1)
+        self.assertEqual(matches["hs_candidates"][0]["parent_description"], "Vegetable tanning extracts")
+        result = classify_item({"product_description": "Other vegetable tanning extract", "hs_code": "3201"},
+                               {"receiver_country": "NZ"}, matches, Mock(return_value=json.dumps({
+                                   "hs6": "320190", "origin_national_code": "3201900011G",
+                                   "destination_national_code": "3201900011G", "confidence": "MEDIUM", "needs_review": False})))
+        self.assertEqual(result["destination_country_hts_code"], "3201900011G")
+
     def test_weaviate_country_scope_and_same_country_roles(self):
         query = Mock()
         query.bm25.return_value.objects = [SimpleNamespace(
             uuid="record-id", properties={"code": "8544.42.00.00", "description": "Electric cable"}
         )]
+        query.fetch_objects.return_value.objects = []
         client = Mock()
         client.collections.get.return_value.query = query
         fake_query = ModuleType("weaviate.classes.query")
         fake_query.Filter = Mock()
-        fake_query.Filter.by_property.return_value.equal.side_effect = lambda value: ("country_code", value)
+        class Filters(tuple):
+            def __and__(self, other):
+                return ("and", self, other)
+        fake_query.Filter.by_property.return_value.equal.side_effect = lambda value: Filters(("country_code", value))
+        fake_query.Filter.any_of.side_effect = lambda values: Filters(("any", values))
         fake_query.MetadataQuery = Mock()
         inv = invoice()
         inv["item_level"][0]["country_of_manufacture"] = "Dominican Republic"
@@ -204,6 +393,66 @@ class ExternalBoundaryTests(TestCase):
         self.assertEqual(query.bm25.call_args.kwargs["filters"], ("country_code", "database-country-id"))
         self.assertEqual(matches["origin_candidates"], matches["destination_candidates"])
         self.assertEqual(matches["hs_candidates"][0]["hs_code"], "854442")
+        query.fetch_objects.assert_called_once()
+
+    def test_weaviate_code_lookup_recovers_other_rows_for_both_countries(self):
+        from weaviate.classes.query import Filter
+
+        query = Mock()
+        query.bm25.return_value.objects = [SimpleNamespace(
+            uuid="irrelevant", properties={"code": "7616999001", "description": "Aluminium radiator"})]
+        query.fetch_objects.side_effect = [SimpleNamespace(objects=[
+            SimpleNamespace(uuid="au", properties={"code": "8708299194", "description": "Other"}),
+            SimpleNamespace(uuid="au-duplicate", properties={"code": "8708299194", "description": "Other"}),
+            SimpleNamespace(uuid="deleted", properties={"code": "8708299995", "description": "Other", "isdelete": True}),
+            SimpleNamespace(uuid="heading", properties={"code": "8708299", "description": "Other", "is_leaf": False}),
+        ]), SimpleNamespace(objects=[
+            SimpleNamespace(uuid="gb", properties={"code": "8708299000", "description": "Other"}),
+        ])]
+        client = Mock()
+        client.collections.get.return_value.query = query
+        matches = WeaviateRetriever(client, {"GB": "225", "AU": "14"}).retrieve(
+            {"product_description": "Radiator Grille", "country_of_manufacture": "GB", "hs_code": "8708299000"},
+            {"destination_country": "Australia", "receiver_country": None})
+        self.assertEqual(query.fetch_objects.call_count, 2)
+        self.assertEqual(matches["origin_candidates"][-1]["national_code"], "8708299000")
+        self.assertEqual([r["national_code"] for r in matches["destination_candidates"] if r["hs6"] == "870829"], ["8708299194"])
+        self.assertIn("870829", [r["hs_code"] for r in matches["hs_candidates"]])
+        for call, country_id in zip(query.fetch_objects.call_args_list, ["14", "225"]):
+            expected = Filter.by_property("country_code").equal(country_id) & Filter.any_of([
+                Filter.by_property("code").like("8708.29*"), Filter.by_property("code").like("870829*")])
+            actual = call.kwargs["filters"]
+            self.assertEqual(actual.filters[0], expected.filters[0])
+            self.assertEqual(actual.filters[1].filters, expected.filters[1].filters)
+
+    def test_weaviate_missing_invoice_code_expands_discovered_hs6(self):
+        query = Mock()
+        query.bm25.return_value.objects = [SimpleNamespace(
+            uuid="hs6", properties={"code": "854442", "description": "Electric cable"})]
+        query.fetch_objects.return_value.objects = [SimpleNamespace(
+            uuid="national", properties={"code": "8544420000", "description": "Other"})]
+        client = Mock()
+        client.collections.get.return_value.query = query
+        matches = WeaviateRetriever(client, {"FI": "74"}).retrieve(
+            {"product_description": "Electric cable", "country_of_manufacture": "FI"},
+            {"receiver_country": "FI"})
+        self.assertEqual(matches["origin_candidates"], matches["destination_candidates"])
+        self.assertEqual(matches["origin_candidates"][0]["national_code"], "8544420000")
+        query.fetch_objects.assert_called_once()
+
+    def test_weaviate_skips_origin_country_when_invoice_origin_code_exists(self):
+        query = Mock()
+        query.bm25.return_value.objects = []
+        query.fetch_objects.return_value.objects = []
+        client = Mock()
+        client.collections.get.return_value.query = query
+        WeaviateRetriever(client, {"GB": "225", "AU": "14"}).retrieve(
+            {"product_description": "Grille", "country_of_manufacture": "GB",
+             "manufacturing_country_hts_code": "8708299000"}, {"receiver_country": "AU"})
+        query.bm25.assert_called_once()
+        self.assertEqual(query.bm25.call_args.kwargs["filters"].value, "14")
+        query.fetch_objects.assert_called_once()
+        self.assertEqual(query.fetch_objects.call_args.kwargs["filters"].filters[0].value, "14")
 
     def test_qwen_context_budget_and_truncation(self):
         import torch
@@ -247,6 +496,35 @@ class ExternalBoundaryTests(TestCase):
 
 
 class PipelineTests(TestCase):
+    def test_pdf_decompression_warning_reopens_before_returning_images(self):
+        with TemporaryDirectory() as folder:
+            pdf = Path(folder) / "invoice.pdf"
+            make_pdf(pdf)
+            with patch("pymupdf.TOOLS.mupdf_warnings", side_effect=["", "zlib error: incorrect header check", "", "", ""]), self.assertLogs(
+                "AI.utils", level="WARNING"
+            ):
+                paths = pdf_to_images(pdf, dpi=72, output_dir=Path(folder) / "pages")
+            self.assertEqual(len(paths), 2)
+            self.assertTrue(all(Path(path).is_file() for path in paths))
+
+    def test_pdf_with_broken_deflate_stream_is_rejected_before_ocr(self):
+        import pymupdf
+
+        with TemporaryDirectory() as folder:
+            pdf = Path(folder) / "corrupt.pdf"
+            with pymupdf.open() as doc:
+                page = doc.new_page()
+                page.insert_text((50, 50), "Invoice")
+                xref = page.get_contents()[0]
+                doc.update_stream(xref, b"this is not a zlib stream", compress=False)
+                doc.xref_set_key(xref, "Filter", "/FlateDecode")
+                doc.save(pdf)
+            model = Mock()
+            with self.assertLogs("AI.utils", level="WARNING"), self.assertRaisesRegex(ValueError, "compressed-stream decoding error"):
+                extract_doc(pdf, Path(folder) / "out", {"ocr_model": model, "ocr_tokenizer": None})
+            model.infer_multi.assert_not_called()
+            self.assertFalse(list((Path(folder) / "out").glob("pages_*")))
+
     def test_expanded_order_fields_are_extracted_without_changing_values(self):
         order = {
             "company_name": "Acme Corporation",
@@ -310,12 +588,64 @@ class PipelineTests(TestCase):
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
             client = Mock()
-            with patch("AI.db_connect.connect_vdb", return_value={"weaviate_client": client}), patch(
+            with patch("AI.main.extract_doc"), patch("AI.main.clean_extracted_text", return_value="Invoice"), patch(
+                "AI.main.format_json", return_value={"invoices": [invoice()]}
+            ), patch("AI.db_connect.connect_vdb", return_value={"weaviate_client": client}), patch(
                 "AI.main.WeaviateRetriever.load_country_map", side_effect=ConnectionError("country service unavailable")
             ):
                 with self.assertRaisesRegex(ConnectionError, "country service unavailable"):
-                    doc_pipeline(pdf, Path(folder) / "output", backend="weaviate")
+                    doc_pipeline(pdf, Path(folder) / "output", backend="weaviate", models={"ocr": {}}, generate=Mock())
             client.close.assert_called_once()
+
+    def test_complete_invoice_codes_skip_db_catalog_and_classification(self):
+        inv = invoice()
+        inv["item_level"][0].update(hs_code="8544", manufacturing_country_hts_code="8544490000",
+                                    destination_country_hts_code="8544490010")
+        generate = Mock(return_value=json.dumps({"invoices": [inv]}))
+        with TemporaryDirectory() as folder:
+            pdf = Path(folder) / "invoice.pdf"
+            make_pdf(pdf)
+            with patch("AI.main.extract_doc"), patch("AI.main.clean_extracted_text", return_value="Invoice"), patch(
+                "AI.db_connect.connect_vdb", side_effect=AssertionError("DB must not be contacted")
+            ) as connect, patch("AI.main.CatalogRetriever.load") as load_catalog:
+                result = doc_pipeline(pdf, Path(folder) / "out", backend="weaviate", models={"ocr": {}}, generate=generate)
+            connect.assert_not_called()
+            load_catalog.assert_not_called()
+            generate.assert_called_once()  # Extraction only; no classification.
+            item = result["invoices"][0]["item_level"][0]
+            self.assertEqual(item["hs_code"], "8544")
+            self.assertEqual(item["manufacturing_country_hts_code"], "8544490000")
+            self.assertEqual(item["destination_country_hts_code"], "8544490010")
+            self.assertEqual(item["hts_extraction_source"], "invoice")
+            self.assertNotIn("unavailable", item["validation_note"])
+
+    def test_nz_invoice_codes_skip_retrieval_with_check_letter(self):
+        from AI.utils import fetch_hts
+        inv = invoice()
+        inv["order_level"]["receiver_country"] = "NZ"
+        item = inv["item_level"][0]
+        item.update(manufacturing_country_hts_code="3201900029", destination_country_hts_code="3201900011G")
+        retriever = Mock()
+        matches = fetch_hts({"invoices": [inv]}, retriever)
+        retriever.retrieve.assert_not_called()
+        generate = Mock()
+        result = classify_item(item, inv["order_level"], matches[0], generate)
+        generate.assert_not_called()
+        self.assertEqual(result["destination_country_hts_code"], "3201900011G")
+
+    def test_mixed_invoice_retrieves_only_items_with_missing_codes(self):
+        from AI.utils import fetch_hts
+        complete = invoice()["item_level"][0]
+        complete.update(manufacturing_country_hts_code="8544490000", destination_country_hts_code="8544490010")
+        missing = invoice()["item_level"][0]
+        inv = invoice()
+        inv["item_level"] = [complete, missing]
+        retriever = Mock()
+        retriever.retrieve.return_value = CatalogRetriever(ROWS).retrieve(missing, inv["order_level"])
+        matches = fetch_hts({"invoices": [inv]}, retriever)
+        retriever.retrieve.assert_called_once_with(missing, inv["order_level"])
+        self.assertEqual(matches[0]["source"], "invoice")
+        self.assertEqual(matches[1]["item_index"], 1)
 
     def test_server_adapter_remains_ocr_only(self):
         from server.services.processor import DocumentProcessor
@@ -353,6 +683,7 @@ class PipelineTests(TestCase):
             self.assertEqual(text, "<PAGE>invoice data")
             self.assertEqual(len(model.infer_multi.call_args.kwargs["image_files"]), 2)
             self.assertFalse(model.infer_multi.call_args.kwargs["save_results"])
+            model.infer.assert_not_called()
             self.assertFalse(list(output.glob("pages_*")))
 
     def test_failed_ocr_cleans_temporary_pages(self):
@@ -364,6 +695,93 @@ class PipelineTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, "inference failed"):
                 extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
             self.assertFalse(list(Path(folder).glob("pages_*")))
+
+    def test_empty_multi_page_ocr_retries_every_page_in_order(self):
+        with TemporaryDirectory() as folder:
+            pdf = Path(folder) / "invoice.pdf"
+            make_pdf(pdf)
+            model = Mock()
+            model.infer_multi.return_value = ("<PAGE>\n", 1)
+            model.infer.side_effect = ["Invoice first page", "Invoice second page"]
+            with self.assertLogs("AI.utils", level="WARNING"):
+                raw = extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
+            self.assertEqual(raw, "Invoice first page\n<PAGE>\nInvoice second page")
+            self.assertEqual(model.infer_multi.call_args.kwargs["prompt"], "<image>Document parsing.")
+            self.assertEqual(model.infer.call_count, 2)
+            calls = model.infer.call_args_list
+            self.assertTrue(calls[0].kwargs["eval_mode"])
+            self.assertTrue(calls[0].kwargs["crop_mode"])
+            self.assertTrue(calls[0].kwargs["image_file"].endswith("page_0001.png"))
+            self.assertTrue(calls[1].kwargs["image_file"].endswith("page_0002.png"))
+            self.assertEqual((Path(folder) / "detailed_invoice_output.txt").read_text(), raw)
+            self.assertFalse(list(Path(folder).glob("pages_*")))
+
+    def test_empty_retry_reports_page_and_does_not_persist_partial_invoice(self):
+        with TemporaryDirectory() as folder:
+            pdf = Path(folder) / "invoice.pdf"
+            make_pdf(pdf)
+            model = Mock()
+            model.infer_multi.return_value = ("", 0)
+            model.infer.side_effect = ["Page one", ""]
+            with self.assertLogs("AI.utils", level="WARNING"), self.assertRaisesRegex(RuntimeError, "page 2/2"):
+                extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
+            self.assertFalse((Path(folder) / "detailed_invoice_output.txt").exists())
+            self.assertFalse(list(Path(folder).glob("pages_*")))
+
+    def test_unsupported_ocr_return_type_is_explicit(self):
+        with TemporaryDirectory() as folder:
+            pdf = Path(folder) / "invoice.pdf"
+            make_pdf(pdf)
+            model = Mock()
+            model.infer_multi.return_value = {"text": "Unsupported"}
+            with self.assertRaisesRegex(RuntimeError, "Unsupported OCR return type: dict"):
+                extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
+            model.infer.assert_not_called()
+            self.assertFalse(list(Path(folder).glob("pages_*")))
+
+    def test_ocr_restores_settings_after_failure_before_next_document(self):
+        with TemporaryDirectory() as folder:
+            pdf = Path(folder) / "invoice.pdf"
+            make_pdf(pdf)
+            model = Mock()
+            model.config = SimpleNamespace(sliding_window=128)
+            def infer(*args, **kwargs):
+                self.assertEqual(model.config.sliding_window, 128)
+                self.assertFalse(hasattr(model.config, "_ring_window"))
+                model.config.sliding_window = None
+                model.config._ring_window = 128
+                if model.infer_multi.call_count == 1:
+                    raise RuntimeError("First request failed during generation")
+                return "Second invoice", 2
+            model.infer_multi.side_effect = infer
+            bundle = {"ocr_model": model, "ocr_tokenizer": None}
+            with self.assertRaisesRegex(RuntimeError, "First request failed"):
+                extract_doc(pdf, Path(folder) / "first", bundle)
+            self.assertEqual(model.config.sliding_window, 128)
+            self.assertFalse(hasattr(model.config, "_ring_window"))
+            self.assertEqual(extract_doc(pdf, Path(folder) / "second", bundle), "Second invoice")
+            self.assertEqual(model.config.sliding_window, 128)
+            self.assertFalse(hasattr(model.config, "_ring_window"))
+
+    def test_ocr_commentary_retries_and_is_never_passed_to_extraction(self):
+        commentary = ('The Ground Truth image displays a single solid horizontal line. '
+                      'According to Rule 2, the provided OCR result is incorrect.')
+        with TemporaryDirectory() as folder:
+            pdf = Path(folder) / "invoice.pdf"
+            make_pdf(pdf)
+            model = Mock()
+            model.infer_multi.return_value = (commentary, 40)
+            model.infer.side_effect = ["Invoice first page", "Invoice second page"]
+            with self.assertLogs("AI.utils", level="WARNING"):
+                raw = extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
+            self.assertNotIn("Ground Truth", raw)
+            self.assertIn("Invoice first page", raw)
+            self.assertEqual(model.infer.call_count, 2)
+            model.infer.side_effect = None
+            model.infer.return_value = commentary
+            with self.assertLogs("AI.utils", level="WARNING"), self.assertRaisesRegex(RuntimeError, "evaluation commentary"):
+                extract_doc(pdf, Path(folder) / "bad", {"ocr_model": model, "ocr_tokenizer": None})
+            self.assertFalse((Path(folder) / "bad" / "detailed_invoice_output.txt").exists())
 
     def test_table_cell_boundaries_preserved(self):
         self.assertEqual(clean_ocr_text("<tr><td>sku</td><td>42</td></tr>"), "sku\t42")

@@ -1,7 +1,7 @@
 """Runtime configuration. Importing this module performs no I/O."""
 import os
 
-Qconfig = {"max_new_tokens": 8000, "temperature": 0.0}
+Qconfig = {"max_new_tokens": 15000, "temperature": 0.0}
 Oconfig = {"max_length": 15000, "image_size": 1024, "dpi": 350}
 db = {
     "host": os.getenv("WEAVIATE_HOST", "32.236.127.40"),

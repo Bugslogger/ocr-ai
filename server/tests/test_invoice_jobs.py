@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
+from types import SimpleNamespace
 from unittest import TestCase, main
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
@@ -276,6 +277,50 @@ class InvoiceJobTests(TestCase):
             self.assertEqual(self.terminal(first).status, JobStatus.SUCCEEDED)
             self.assertEqual(self.terminal(second).status, JobStatus.SUCCEEDED)
             self.assertEqual(self.terminal(third).status, JobStatus.SUCCEEDED)
+
+    def test_failed_ocr_does_not_poison_next_queued_invoice(self):
+        from AI.utils import extract_doc
+
+        started, release = Event(), Event()
+        model = Mock()
+        model.config = SimpleNamespace(sliding_window=128)
+
+        def infer(*args, **kwargs):
+            self.assertEqual(model.config.sliding_window, 128)
+            self.assertFalse(hasattr(model.config, "_ring_window"))
+            model.config.sliding_window = None
+            model.config._ring_window = 128
+            if model.infer_multi.call_count == 1:
+                started.set()
+                if not release.wait(5):
+                    raise RuntimeError("Test did not release first invoice")
+                raise RuntimeError("Injected OCR generation failure")
+            return "Second invoice text", 3
+
+        model.infer_multi.side_effect = infer
+
+        def pipeline(pdf, output, **options):
+            options["progress"]("running_ocr")
+            extract_doc(pdf, output, {"ocr_model": model, "ocr_tokenizer": None})
+            return extracted_result()
+
+        with patch("AI.main.doc_pipeline", side_effect=pipeline), self.assertLogs(
+            "server.services.invoice_jobs", level="ERROR"
+        ):
+            try:
+                first = self.submit().json()["job_id"]
+                self.assertTrue(started.wait(2))
+                second = self.submit().json()["job_id"]
+                self.assertEqual(self.service.get(second).status, JobStatus.QUEUED)
+            finally:
+                release.set()
+            self.assertEqual(self.terminal(first).status, JobStatus.FAILED)
+            final = self.terminal(second)
+            self.assertEqual(final.status, JobStatus.SUCCEEDED)
+            self.assertEqual(final.result.model_dump(), extracted_result())
+        self.assertEqual(model.infer_multi.call_count, 2)
+        self.assertEqual(model.config.sliding_window, 128)
+        self.assertFalse(hasattr(model.config, "_ring_window"))
 
     def test_job_socket_streams_progress_and_persisted_result_on_reconnect(self):
         started, release = Event(), Event()

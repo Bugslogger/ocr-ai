@@ -24,11 +24,11 @@ flowchart TD
     M --> N[Save final classification JSON]
 ```
 
-1. **Render and OCR.** PyMuPDF renders every page at the configured DPI. `infer_multi()` processes the page images and returns text directly. Temporary images are removed on success and failure. The raw text is written to `detailed_invoice_output.txt`.
+1. **Render and OCR.** PyMuPDF renders every page at the configured DPI. `infer_multi()` processes the page images using the original Document parsing prompt and returns text directly. Empty/markup-only output or recognizable Ground Truth evaluation commentary triggers a retry of each page with the cropped single-image `infer()` API and the same parsing prompt. Every retry page must produce usable text; otherwise the run fails with the page number instead of returning a partial invoice. Each inference call restores the model's temporary sliding-window settings in `finally`, including on failure, so retries and subsequent queued invoices start with the original settings. Retry diagnostics log page count, text length, and output token count without invoice text. Temporary images are removed on success and failure. The raw text is written to `detailed_invoice_output.txt`.
 2. **Clean.** Detection coordinates and markup are removed, preserving table cell boundaries and page breaks. The result is written to `plain_invoice_text.txt`. Empty OCR output stops the run.
 3. **Extract.** Qwen receives the text and the shared JSON Schema. It extracts invoice, shipment, and line-item fields without inferring tariff codes. Missing values are null. Manufacturing country must come from product evidence; it is not copied from the sender's address.
 4. **Validate extraction.** Malformed JSON, missing fields, unexpected fields, incorrect field types, empty invoice lists, and empty item lists stop the run. Valid extraction is saved before classification modifies it.
-5. **Retrieve.** The selected backend returns international and country-specific candidates for each item. Records use `(invoice_index, item_index)`, so SKU collisions cannot overwrite another item's results. Country lookup uses exact names, ISO codes, and explicit aliases.
+5. **Retrieve missing codes.** Country-specific codes explicitly printed on the invoice take precedence. Items with both structurally valid national codes skip retrieval and classification; if every item is complete, the tariff backend is never opened or downloaded. For incomplete items, Weaviate queries only countries whose codes are missing or malformed. Records use `(invoice_index, item_index)`, so SKU collisions cannot overwrite another item's results. Country lookup uses exact names, ISO codes, and explicit aliases.
 6. **Select and validate.** Qwen may choose only retrieved HS6 values. Each national code must occur in the corresponding country's candidate list and extend the chosen HS6. Invalid selections are rejected before formatting. An item's classification failure becomes a reviewable result; processing continues for other items.
 7. **Persist.** Each item receives classification fields, evidence, and review status. The complete result is written to `final_classification.json` and returned to the caller.
 
@@ -48,6 +48,8 @@ flowchart TD
 | `tests/test_pipeline.py` | Regression tests with small PDFs and fake model/database responses |
 
 Imports do not download models or contact databases. Models load on the first processing call and remain cached in that process. Full pipeline calls are serialized; OCR inference also has a shared lock because the model temporarily changes its configuration.
+
+OCR generation explicitly supplies an all-ones attention mask for the model's single unpadded input and a padding token ID. The repository's default `max_new_tokens` is cleared for these calls so `Oconfig.max_length` controls the total input/output sequence limit. The temporary generation wrapper and sliding-window settings are restored even after an exception. PDF validation and rendering share a separate lock; a MuPDF compressed-stream warning triggers one fresh-open render attempt. Persistent decompression errors fail before the rendered images reach OCR, rather than accepting a partial page.
 
 ## Installation
 
@@ -129,7 +131,7 @@ National overlays are optional JSON arrays configured by `--national-index` or `
 | `title` | Description shown to the selecting model |
 | `legal_text` | Optional additional source text |
 
-Overlay codes must contain 7 to 12 digits and begin with their HS6. Rows with invalid countries, missing catalog codes, or inconsistent prefixes fail at loading. Supply catalog and national data from compatible editions and retain their source/version records. The loader checks structure and membership; it does not establish that a file is an official or current tariff schedule.
+Overlay codes must contain 7 to 12 digits and begin with their HS6. New Zealand codes may instead contain ten digits followed by one check letter; the complete code is preserved and matched, including that letter. Rows with invalid countries, missing catalog codes, or inconsistent prefixes fail at loading. Supply catalog and national data from compatible editions and retain their source/version records. The loader checks structure and membership; it does not establish that a file is an official or current tariff schedule.
 
 ## Weaviate retrieval
 
@@ -151,7 +153,7 @@ The database connection does not require an API key and sends no authentication 
 
 The `Hs_category` collection must expose `country_code`, `code`, `description`, and `indent` properties. `country_code` is queried as a string. Country database IDs are mapped from `https://bapi.logistx.us/his_countries`. API labels such as `Finland - FI (EU)` are parsed using their validated ISO suffix. Standard country entries take precedence over alternate schedules such as `Israel (11 digits) - IL`, regardless of API order. Inactive and invalid entries are skipped; conflicting standard IDs fail explicitly. An unavailable API fails the run; an unmapped country produces no candidates for that role.
 
-BM25 retrieves at most 25 rows per distinct origin/destination country. Six-digit rows provide international candidates; longer numeric rows also provide national candidates. Origin and destination can share the same lookup when the countries match. Search relevance is not used to fabricate a parent-child tree. This backend's candidate coverage depends on database contents and the search limit.
+BM25 retrieves at most 25 rows per distinct origin/destination country. A second country-filtered code-prefix lookup retrieves up to 100 rows per country, including national entries described only as "Other" that keyword search misses. Prefixes come from invoice tariff evidence when available, otherwise from the retrieved HS6 candidates. Six-digit rows provide international candidates; longer national rows provide candidates unless marked as non-leaf headings. New Zealand statistical check letters are retained and validated within that jurisdiction. Parent descriptions are supplied where retrieved to clarify titles such as "Other". Duplicate national codes are removed, and inactive/deleted rows are excluded. Destination uses `destination_country`, falling back to `receiver_country`. Origin and destination share lookups when the countries match. Search relevance is not used to fabricate a parent-child tree. This backend's candidate coverage depends on database contents and the search limits; the model must still select and validate a suitable national code.
 
 The pipeline closes the Weaviate connection in a `finally` block, including on failure. Callers using `connect_vdb()` themselves own and must close its returned client.
 
@@ -171,13 +173,16 @@ Extraction has three groups per invoice: `order_level`, `item_level`, and `shipm
 
 `order_level` includes company and invoice details; separate shipper and receiver contact/address fields (including email, phone, state, and both address lines); gross/net weights; package count; total quantity, amount, item value, and shipping/handling; dimensions in cm; origin/destination phone codes; and shipment origin/destination countries. All 42 fields are required keys, with null for missing information. Weights, quantities, and amounts are numbers; `package_count` is an integer. Phone numbers/calling codes, postal codes, and `dimensions_cm` remain strings. Shipment origin is separate from each item's country of manufacture.
 
+Invoices may name three or more countries. `item_level.country_of_manufacture` represents product origin (Country of Origin/COO/Made in), while `order_level.origin_country` represents shipment departure/export. For goods made in China, exported from the UK, and delivered to Australia, these fields are China, United Kingdom, and Australia (`destination_country`) respectively. Origin national tariff retrieval uses China. Item-specific manufacturing evidence takes precedence over a declaration covering all goods, so different items may have different manufacturing countries. When product-origin evidence is absent, it stays null; the exporter or shipper country is not substituted.
+
 Classification adds:
 
 | Field | Meaning |
 | --- | --- |
 | `hs6_code` | Selected international HS6, or null |
-| `hs_code` | Inferred HS6 fallback; a valid numeric invoice-supplied value takes precedence when present |
-| `manufacturing_country_hts_code` | Origin national candidate, or retained invoice value |
+| `hs_code` | Four-digit heading when the invoice supplies only four digits; otherwise the first six digits of a valid numeric invoice code, or the inferred HS6. Original printed codes remain in `invoice_tariff_codes` |
+| `manufacturing_country_hts_code` | Full national code explicitly extracted for the manufacturing country takes precedence; if missing or malformed, use the validated origin-country candidate, otherwise null |
+| `manufacturing_country_hts_source` | `invoice`, the retrieval source, or null when no origin national code is available |
 | `destination_country_hts_code` | Destination national candidate, or retained invoice value |
 | `destination_tariff_code` | Alias of the final destination national field |
 | `invoice_tariff_codes` | Original explicitly extracted code values, when present |
@@ -187,6 +192,8 @@ Classification adds:
 | `needs_review` | True for missing destination/national coverage, rejected selections, failures, model uncertainty, or invoice-supplied code evidence |
 | `validation_note` | Validation results and reasons for review |
 | `classification_reason` | Model explanation or failure reason |
+
+National candidates passed to the selecting model are filtered to the allowed HS6 set. A rejected HS6 selection receives LOW confidence and an explicit rejection reason; its original model explanation is not presented as a successful classification.
 
 Review flags take priority over confidence. A result requiring review cannot retain HIGH confidence. Invoice-supplied codes may conflict with inferred codes; the original values are preserved as evidence, and the row remains reviewable. A sender's country is not used as a substitute for country of manufacture.
 

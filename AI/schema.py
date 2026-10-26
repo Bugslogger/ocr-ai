@@ -31,6 +31,17 @@ def object_schema(properties):
 STRING = {"type": ["string", "null"]}
 NUMBER = {"type": ["number", "null"]}
 INTEGER = {"type": ["integer", "null"]}
+COUNTRY_DESCRIPTIONS = {
+    "origin_country": "Shipment departure/export country, not the product's country of origin or manufacture.",
+    "shipper_country": "Country in the shipper/exporter's address; not proof of product origin.",
+    "destination_country": "Actual goods delivery/Ship To country, separate from product origin and export country.",
+    "receiver_country": "Country in the receiver's address.",
+    "country_of_manufacture": (
+        "Product country of origin/manufacture from explicit Country of Origin, COO, Made in, or Manufactured in evidence. "
+        "Item-specific evidence takes precedence over a declaration covering all goods. Never substitute the export/shipper country; "
+        "null when product-origin evidence is absent."
+    ),
+}
 INVOICE_SCHEMA = object_schema({
     "invoices": {"type": "array", "minItems": 1, "items": object_schema({
         "order_level": object_schema({
@@ -43,6 +54,14 @@ INVOICE_SCHEMA = object_schema({
         "shipment": object_schema({k: STRING for k in ("invoice_number", "invoice_date", "currency")}),
     })},
 })
+
+# Describe existing fields without changing the API's required keys or types.
+_invoice_properties = INVOICE_SCHEMA["properties"]["invoices"]["items"]["properties"]
+for _group in (_invoice_properties["order_level"]["properties"],
+               _invoice_properties["item_level"]["items"]["properties"]):
+    for _field, _description in COUNTRY_DESCRIPTIONS.items():
+        if _field in _group:
+            _group[_field] = {**_group[_field], "description": _description}
 
 
 def validate_invoice(value):

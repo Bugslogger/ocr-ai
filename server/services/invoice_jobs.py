@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 STAGES = {
     "queued": (0, "Waiting in the invoice queue"),
     "starting": (1, "Worker started; waiting for the shared pipeline if busy"),
-    "loading_tariff_index": (5, "Connecting to the tariff backend and loading reference data"),
+    "loading_tariff_index": (70, "Loading tariff reference data for codes missing from the invoice"),
     "loading_models": (10, "Loading or reusing OCR and Qwen models"),
     "running_ocr": (20, "Reading invoice pages with OCR"),
     "cleaning_text": (45, "Cleaning the extracted OCR text"),

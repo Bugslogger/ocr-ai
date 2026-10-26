@@ -69,9 +69,10 @@ class InvoiceProcessor:
     @staticmethod
     def _validate_pdf(path: Path) -> None:
         import pymupdf
+        from AI.utils import PDF_LOCK
 
         try:
-            with pymupdf.open(path) as document:
+            with PDF_LOCK, pymupdf.open(path) as document:
                 if not document.is_pdf:
                     raise InvalidInvoiceError("The uploaded file is not a PDF")
                 if document.needs_pass:

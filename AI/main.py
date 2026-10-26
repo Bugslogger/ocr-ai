@@ -6,7 +6,7 @@ import argparse
 import os
 
 from .model import download_ocr, download_qwen
-from .tariff import CatalogRetriever, WeaviateRetriever
+from .tariff import CatalogRetriever, WeaviateRetriever, needs_tariff_lookup
 from .utils import (extract_doc, clean_extracted_text, format_json, make_generator,
                     fetch_hts, update_invoice, save_json)
 
@@ -30,17 +30,6 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
     # Serialize calls sharing process-local GPU models.
     with PIPELINE_LOCK:
         try:
-            report("loading_tariff_index")
-            if retriever is None:
-                if backend == "catalog":
-                    retriever = CatalogRetriever.load(catalog_path or os.getenv("HS_CATALOG_PATH"),
-                                                      national_path or os.getenv("NATIONAL_INDEX_PATH"))
-                elif backend == "weaviate":
-                    from .db_connect import connect_vdb
-                    connection = connect_vdb()["weaviate_client"]
-                    retriever = WeaviateRetriever(connection, WeaviateRetriever.load_country_map())
-                else:
-                    raise ValueError(f"Unknown retrieval backend: {backend}")
             report("loading_models")
             models = models if models is not None else download_models()
             if generate is None:
@@ -51,6 +40,18 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
             cleaned = clean_extracted_text(destination)
             report("extracting_json")
             parsed = format_json(cleaned_text=cleaned, output_path=destination, generate=generate)
+            missing_codes = any(needs_tariff_lookup(item, inv["order_level"]) for inv in parsed["invoices"] for item in inv["item_level"])
+            if retriever is None and missing_codes:
+                report("loading_tariff_index")
+                if backend == "catalog":
+                    retriever = CatalogRetriever.load(catalog_path or os.getenv("HS_CATALOG_PATH"),
+                                                      national_path or os.getenv("NATIONAL_INDEX_PATH"))
+                elif backend == "weaviate":
+                    from .db_connect import connect_vdb
+                    connection = connect_vdb()["weaviate_client"]
+                    retriever = WeaviateRetriever(connection, WeaviateRetriever.load_country_map())
+                else:
+                    raise ValueError(f"Unknown retrieval backend: {backend}")
             report("retrieving_tariffs")
             matches = fetch_hts(parsed, retriever)
             save_json(destination / "db_matches.json", matches)
