@@ -126,7 +126,8 @@ class CatalogRetriever:
         return cls(rows, national, source=source)
 
     def retrieve(self, item, order):
-        query = tokens(item.get("product_description") or item.get("simplified_description"))
+        query = tokens(item.get("classification_search_description")
+                       or item.get("product_description") or item.get("simplified_description"))
         scored = [(sum(self.idf[word] for word in query & words), row)
                   for row, words in zip(self.rows, self.wordsets)]
         scored.sort(key=lambda pair: (-pair[0], pair[1]["hs_code"]))
@@ -194,7 +195,8 @@ class WeaviateRetriever:
     def retrieve(self, item, order):
         from weaviate.classes.query import Filter, MetadataQuery
 
-        description = item.get("product_description") or item.get("simplified_description") or ""
+        description = (item.get("classification_search_description")
+                       or item.get("product_description") or item.get("simplified_description") or "")
         origin = iso2_from_country(item.get("country_of_manufacture"))
         destination = iso2_from_country(order.get("destination_country") or order.get("receiver_country"))
         hits = {}
@@ -297,7 +299,8 @@ def validate_selection(result, sku, candidates, dest_national_rows, orig_nationa
 def classify_item(item, order, matches, generate):
     from .utils import parse_json_maybe
 
-    desc = item.get("product_description") or item.get("simplified_description") or ""
+    desc = (item.get("classification_search_description")
+            or item.get("product_description") or item.get("simplified_description") or "")
     hs6 = dest_nat = orig_nat = None
     confidence = "LOW"
     review = True
@@ -331,6 +334,7 @@ def classify_item(item, order, matches, generate):
         allowed_hs = {row["hs_code"] for row in candidates}
         prompt = {
             "product": desc, "sku": item.get("sku_code"),
+            "product_identification": item.get("product_identification"),
             "origin_iso": matches["origin_iso"], "destination_iso": matches["destination_iso"],
             "hs_candidates": candidates,
             "origin_candidates": [row for row in matches["origin_candidates"] if row["hs6"] in allowed_hs],

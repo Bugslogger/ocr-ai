@@ -41,6 +41,20 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
             report("extracting_json")
             parsed = format_json(cleaned_text=cleaned, output_path=destination, generate=generate)
             missing_codes = any(needs_tariff_lookup(item, inv["order_level"]) for inv in parsed["invoices"] for item in inv["item_level"])
+            if missing_codes:
+                report("identifying_products")
+                from .product_pipeline import identify_products
+
+                product_results = identify_products(parsed, destination / "product_identification.json",
+                                                     generate=generate, progress=report)
+                for product in product_results["products"]:
+                    item = parsed["invoices"][product["invoice_index"]]["item_level"][product["item_index"]]
+                    identification = product["identification"]
+                    item["product_identification"] = identification
+                    item["classification_search_description"] = (
+                        identification["search_query"] or item.get("product_description")
+                        or item.get("simplified_description")
+                    )
             if retriever is None and missing_codes:
                 report("loading_tariff_index")
                 if backend == "catalog":

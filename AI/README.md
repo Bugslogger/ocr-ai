@@ -157,6 +157,14 @@ BM25 retrieves at most 25 rows per distinct origin/destination country. A second
 
 The pipeline closes the Weaviate connection in a `finally` block, including on failure. Callers using `connect_vdb()` themselves own and must close its returned client.
 
+Before tariff candidate retrieval, the invoice pipeline runs product identification
+for invoices with at least one item that needs tariff lookup. It saves positional
+profiles to `product_identification.json`, uses each profile's search query for the
+catalog/Weaviate search, and includes the profile alongside the original description
+when Qwen selects among candidates. Original invoice descriptions and tariff evidence
+remain available for validation; model identification does not itself choose a code.
+Items with complete invoice tariff codes skip both retrieval and product identification.
+
 ## Output contract
 
 Every output directory contains these files after a successful run:
