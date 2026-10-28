@@ -6,6 +6,7 @@ from threading import RLock
 _models = {}
 _lock = RLock()
 _file_download_lock = RLock()
+# MODEL_DEFAULTS = {"ocr": "baidu/Unlimited-OCR", "qwen": "Qwen/Qwen3-30B-A3B-Instruct-2507"}
 MODEL_DEFAULTS = {"ocr": "baidu/Unlimited-OCR", "qwen": "Qwen/Qwen2.5-7B-Instruct"}
 
 

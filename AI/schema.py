@@ -25,7 +25,8 @@ NUMBER_FIELDS = (
 
 def object_schema(properties):
     return {"type": "object", "properties": properties,
-            "required": list(properties), "additionalProperties": False}
+            "required": [key for key, schema in properties.items() if "null" not in schema["type"]],
+            "additionalProperties": False}
 
 
 STRING = {"type": ["string", "null"]}
@@ -64,9 +65,28 @@ for _group in (_invoice_properties["order_level"]["properties"],
             _group[_field] = {**_group[_field], "description": _description}
 
 
+def _fill_missing_fields(value, schema):
+    """Materialize absent nullable fields without coercing supplied values."""
+    if schema.get("type") == "object" and isinstance(value, dict):
+        result = dict(value)
+        for key, field_schema in schema["properties"].items():
+            if key not in result:
+                if "null" in field_schema["type"]:
+                    result[key] = None
+                elif field_schema["type"] == "object":
+                    result[key] = {}
+            if key in result:
+                result[key] = _fill_missing_fields(result[key], field_schema)
+        return result
+    if schema.get("type") == "array" and isinstance(value, list):
+        return [_fill_missing_fields(item, schema["items"]) for item in value]
+    return value
+
+
 def validate_invoice(value):
     from jsonschema import Draft202012Validator
 
+    value = _fill_missing_fields(value, INVOICE_SCHEMA)
     errors = sorted(Draft202012Validator(INVOICE_SCHEMA).iter_errors(value),
                     key=lambda e: str(list(e.absolute_path)))
     if errors:

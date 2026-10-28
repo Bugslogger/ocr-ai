@@ -111,6 +111,7 @@ FINAL COUNTRY MAPPING CHECK:
 - For the three-country example above the exact mapping is: order_level.origin_country="United Kingdom"; order_level.destination_country="Australia"; item_level[0].country_of_manufacture="China".
 
 OUTPUT:
+All invoice data fields are optional information. Include every field with null when it is absent or unknown; never invent a value to fill a field.
 Return ONLY valid JSON matching the schema below.
 Do not add explanations, markdown, or text outside the JSON.
 JSON Schema:

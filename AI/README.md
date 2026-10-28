@@ -27,7 +27,7 @@ flowchart TD
 1. **Render and OCR.** PyMuPDF renders every page at the configured DPI. `infer_multi()` processes the page images using the original Document parsing prompt and returns text directly. Empty/markup-only output or recognizable Ground Truth evaluation commentary triggers a retry of each page with the cropped single-image `infer()` API and the same parsing prompt. Every retry page must produce usable text; otherwise the run fails with the page number instead of returning a partial invoice. Each inference call restores the model's temporary sliding-window settings in `finally`, including on failure, so retries and subsequent queued invoices start with the original settings. Retry diagnostics log page count, text length, and output token count without invoice text. Temporary images are removed on success and failure. The raw text is written to `detailed_invoice_output.txt`.
 2. **Clean.** Detection coordinates and markup are removed, preserving table cell boundaries and page breaks. The result is written to `plain_invoice_text.txt`. Empty OCR output stops the run.
 3. **Extract.** Qwen receives the text and the shared JSON Schema. It extracts invoice, shipment, and line-item fields without inferring tariff codes. Missing values are null. Manufacturing country must come from product evidence; it is not copied from the sender's address.
-4. **Validate extraction.** Malformed JSON, missing fields, unexpected fields, incorrect field types, empty invoice lists, and empty item lists stop the run. Valid extraction is saved before classification modifies it.
+4. **Validate extraction.** Missing invoice data fields are filled with null before validation, including fields in omitted order and shipment objects. Malformed JSON, unexpected fields, incorrect supplied field types, empty invoice lists, and empty item lists stop the run. Valid extraction is saved before classification modifies it.
 5. **Retrieve missing codes.** Country-specific codes explicitly printed on the invoice take precedence. Items with both structurally valid national codes skip retrieval and classification; if every item is complete, the tariff backend is never opened or downloaded. For incomplete items, Weaviate queries only countries whose codes are missing or malformed. Records use `(invoice_index, item_index)`, so SKU collisions cannot overwrite another item's results. Country lookup uses exact names, ISO codes, and explicit aliases.
 6. **Select and validate.** Qwen may choose only retrieved HS6 values. Each national code must occur in the corresponding country's candidate list and extend the chosen HS6. Invalid selections are rejected before formatting. An item's classification failure becomes a reviewable result; processing continues for other items.
 7. **Persist.** Each item receives classification fields, evidence, and review status. The complete result is written to `final_classification.json` and returned to the caller.
@@ -171,7 +171,7 @@ Every output directory contains these files after a successful run:
 
 Extraction has three groups per invoice: `order_level`, `item_level`, and `shipment`. The exact fields and nullable types are defined in `schema.py`. Quantity is numeric and may be fractional. Monetary values remain in the invoice's stated currency.
 
-`order_level` includes company and invoice details; separate shipper and receiver contact/address fields (including email, phone, state, and both address lines); gross/net weights; package count; total quantity, amount, item value, and shipping/handling; dimensions in cm; origin/destination phone codes; and shipment origin/destination countries. All 42 fields are required keys, with null for missing information. Weights, quantities, and amounts are numbers; `package_count` is an integer. Phone numbers/calling codes, postal codes, and `dimensions_cm` remain strings. Shipment origin is separate from each item's country of manufacture.
+`order_level` includes company and invoice details; separate shipper and receiver contact/address fields (including email, phone, state, and both address lines); gross/net weights; package count; total quantity, amount, item value, and shipping/handling; dimensions in cm; origin/destination phone codes; and shipment origin/destination countries. All 42 data fields are optional during extraction; omitted fields are returned as null in the normalized output. Weights, quantities, and amounts are numbers; `package_count` is an integer. Phone numbers/calling codes, postal codes, and `dimensions_cm` remain strings. Shipment origin is separate from each item's country of manufacture.
 
 Invoices may name three or more countries. `item_level.country_of_manufacture` represents product origin (Country of Origin/COO/Made in), while `order_level.origin_country` represents shipment departure/export. For goods made in China, exported from the UK, and delivered to Australia, these fields are China, United Kingdom, and Australia (`destination_country`) respectively. Origin national tariff retrieval uses China. Item-specific manufacturing evidence takes precedence over a declaration covering all goods, so different items may have different manufacturing countries. When product-origin evidence is absent, it stays null; the exporter or shipper country is not substituted.
 
@@ -220,3 +220,41 @@ python -m unittest discover -s AI/tests -v
 Tests use local generated PDFs and fake model/database responses. They cover country matching, national-prefix rejection, absent overlays, preserved invoice evidence, multiple invoices, duplicate/missing SKUs, temporary-file cleanup, context budgets, truncation detection, and imports without model/network side effects. Synthetic national codes in test fixtures test validation mechanics, not tariff correctness.
 
 A real GPU smoke test should process a known invoice and compare every extracted item, quantity, amount, country, and code with the source PDF. Schema validation verifies structure, not whether OCR or Qwen captured every line. The pipeline does not reconcile financial totals, split oversized documents automatically, prove tariff applicability from legal notes, or calibrate model confidence. Context overflow and output-token exhaustion fail explicitly rather than silently accepting truncated JSON. Short or ambiguous descriptions can still retrieve poor candidates; such results need review even when candidate membership passes.
+
+## Standalone product identification
+
+`product_pipeline.py` identifies product types and creates keyword queries before
+HS/HTS retrieval. It accepts extracted or classified invoice JSON, uses the cached
+Qwen model, and does not run OCR or select tariff codes. The existing invoice
+pipeline does not invoke it automatically.
+
+```bash
+python -m AI.product_pipeline output/review-002/extracted_invoice.json --output output/review-002/products.json
+```
+
+```python
+from AI.product_pipeline import identify_products
+
+profiles = identify_products(extracted_invoice, "output/products.json")
+for product in profiles["products"]:
+    invoice = extracted_invoice["invoices"][product["invoice_index"]]
+    item = invoice["item_level"][product["item_index"]]
+    query = product["identification"]["search_query"]
+    if query:
+        candidates = retriever.retrieve(
+            {**item, "product_description": query}, invoice["order_level"]
+        )
+```
+
+Each result retains invoice/item positions and SKU, with `identification` containing
+`exact_product_name` (specific name preserved from the invoice, including stated
+brand/model), `product_type` (generic category), `primary_function`, `intended_use`, `material`, `construction`,
+`part_or_accessory_of`, `search_terms`, `search_query`, `missing_information`,
+`needs_review`, and `error`. Unknown detail fields are null. No-description items
+skip inference. Invalid or failed model responses flag that item for review and
+use its original description as the search query; remaining items continue.
+Model-loading failures stop the run. Input invoices are not modified.
+
+These profiles are model-generated search aids, not verified product facts or
+validated tariff classifications. Preserve original descriptions as evidence and
+continue applying candidate membership/country validation when selecting codes.

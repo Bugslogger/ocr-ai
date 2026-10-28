@@ -558,7 +558,28 @@ class PipelineTests(TestCase):
         system = generate.call_args.args[0][0]["content"]
         contract = json.loads(system.split("JSON Schema:\n", 1)[1])
         required = contract["properties"]["invoices"]["items"]["properties"]["order_level"]["required"]
-        self.assertEqual(required, list(order))
+        self.assertEqual(required, [])
+
+    def test_omitted_fields_default_to_null_and_are_saved(self):
+        payload = {"invoices": [{"order_level": {"invoice_number": "INV-1"},
+                                 "item_level": [{"product_description": "Cable"}],
+                                 "shipment": {}}]}
+        with TemporaryDirectory() as folder:
+            parsed = format_json(cleaned_text="Invoice", output_path=folder,
+                                 generate=Mock(return_value=json.dumps(payload)))
+            inv = parsed["invoices"][0]
+            self.assertEqual(inv["order_level"], {
+                **dict.fromkeys(ORDER_FIELDS), "invoice_number": "INV-1"})
+            self.assertEqual(inv["item_level"][0], {
+                **dict.fromkeys(ITEM_FIELDS + NUMBER_FIELDS), "product_description": "Cable"})
+            self.assertEqual(inv["shipment"], dict.fromkeys(("invoice_number", "invoice_date", "currency")))
+            self.assertEqual(json.loads((Path(folder) / "extracted_invoice.json").read_text()), parsed)
+
+    def test_missing_order_and_shipment_groups_default_to_null_fields(self):
+        parsed = format_json(cleaned_text="Invoice", generate=Mock(return_value=json.dumps(
+            {"invoices": [{"item_level": [{}]}]})))
+        self.assertEqual(parsed["invoices"][0]["order_level"], dict.fromkeys(ORDER_FIELDS))
+        self.assertIsNone(parsed["invoices"][0]["shipment"]["invoice_number"])
 
     def test_order_numbers_allow_fractions_and_missing_values(self):
         payload = {"invoices": [invoice()]}
