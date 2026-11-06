@@ -6,8 +6,8 @@ from threading import RLock
 _models = {}
 _lock = RLock()
 _file_download_lock = RLock()
-# MODEL_DEFAULTS = {"ocr": "baidu/Unlimited-OCR", "qwen": "Qwen/Qwen3-30B-A3B-Instruct-2507"}
-MODEL_DEFAULTS = {"ocr": "baidu/Unlimited-OCR", "qwen": "Qwen/Qwen2.5-7B-Instruct"}
+MODEL_DEFAULTS = {"ocr": "baidu/Unlimited-OCR", "qwen": "Qwen/Qwen3-30B-A3B-Instruct-2507"}
+# MODEL_DEFAULTS = {"ocr": "baidu/Unlimited-OCR", "qwen": "Qwen/Qwen2.5-7B-Instruct"}
 
 
 def model_spec(kind):
@@ -64,21 +64,83 @@ def download_ocr():
         return _models["ocr"]
 
 
+# def download_qwen():
+#     with _lock:
+#         if "qwen" not in _models:
+#             import torch
+#             from transformers import AutoModelForCausalLM, AutoTokenizer
+
+#             name, revision = model_spec("qwen")
+#             options = {"cache_dir": str(model_cache_dir())}
+#             if revision:
+#                 options["revision"] = revision
+#             tokenizer = AutoTokenizer.from_pretrained(name, **options)
+#             cuda = torch.cuda.is_available()
+#             dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if cuda else torch.float32
+#             model = AutoModelForCausalLM.from_pretrained(
+#                 name, torch_dtype=dtype, device_map="auto", **options
+#             ).eval()
+#             _models["qwen"] = {"Qtokenizer": tokenizer, "Qmodel": model}
+#         return _models["qwen"]
+
 def download_qwen():
     with _lock:
         if "qwen" not in _models:
             import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from transformers import (
+                AutoModelForCausalLM,
+                AutoTokenizer,
+                BitsAndBytesConfig,
+            )
 
+            # Update model_spec("qwen") to return:
+            # Qwen/Qwen3-30B-A3B-Instruct-2507
             name, revision = model_spec("qwen")
-            options = {"cache_dir": str(model_cache_dir())}
+
+            options = {
+                "cache_dir": str(model_cache_dir()),
+            }
+
             if revision:
                 options["revision"] = revision
-            tokenizer = AutoTokenizer.from_pretrained(name, **options)
-            cuda = torch.cuda.is_available()
-            dtype = (torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if cuda else torch.float32
+
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "CUDA GPU is required for this Qwen configuration."
+                )
+
+            dtype = (
+                torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+
+            # 4-bit quantization
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=dtype,
+                bnb_4bit_use_double_quant=True,
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                name,
+                **options
+            )
+
             model = AutoModelForCausalLM.from_pretrained(
-                name, torch_dtype=dtype, device_map="auto", **options
+                name,
+                torch_dtype=dtype,
+                quantization_config=quantization_config,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+                attn_implementation="sdpa",
+                **options
             ).eval()
-            _models["qwen"] = {"Qtokenizer": tokenizer, "Qmodel": model}
+
+            _models["qwen"] = {
+                "Qtokenizer": tokenizer,
+                "Qmodel": model,
+            }
+
         return _models["qwen"]
