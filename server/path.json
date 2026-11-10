@@ -6,11 +6,11 @@
             "downloaded": false,
             "location": null,
             "locations_checked": [
-                "/workspace/AI/models/models--baidu--Unlimited-OCR",
-                "/workspace/AI/model_cache/models--baidu--Unlimited-OCR",
-                "/workspace/AI/huggingface/hub/models--baidu--Unlimited-OCR",
-                "/workspace/AI/models/Unlimited-OCR",
-                "/workspace/.cache/huggingface/hub/models--baidu--Unlimited-OCR"
+                "/AI/models/models--baidu--Unlimited-OCR",
+                "/AI/model_cache/models--baidu--Unlimited-OCR",
+                "/AI/huggingface/hub/models--baidu--Unlimited-OCR",
+                "/AI/models/Unlimited-OCR",
+                "/.cache/huggingface/hub/models--baidu--Unlimited-OCR"
             ]
         },
         {
@@ -18,11 +18,23 @@
             "downloaded": false,
             "location": null,
             "locations_checked": [
-                "/workspace/AI/models/models--Qwen--Qwen2.5-7B-Instruct",
-                "/workspace/AI/model_cache/models--Qwen--Qwen2.5-7B-Instruct",
-                "/workspace/AI/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct",
-                "/workspace/AI/models/Qwen2.5-7B-Instruct",
-                "/workspace/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct"
+                "/AI/models/models--Qwen--Qwen2.5-7B-Instruct",
+                "/AI/model_cache/models--Qwen--Qwen2.5-7B-Instruct",
+                "/AI/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct",
+                "/AI/models/Qwen2.5-7B-Instruct",
+                "/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct"
+            ]
+        },
+        {
+            "model_id": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "downloaded": false,
+            "location": null,
+            "locations_checked": [
+                "/AI/models/models--Qwen--Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "/AI/model_cache/models--Qwen--Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "/AI/huggingface/hub/models--Qwen--Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "/AI/models/Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "/.cache/huggingface/hub/models--Qwen--Qwen/Qwen3-30B-A3B-Instruct-2507"
             ]
         }
     ]
