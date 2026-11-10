@@ -86,7 +86,7 @@ Example event while waiting:
 ```
 
 - `queue_position`: `1` is the next waiting job; `2` means one waiting job is ahead, plus any job already processing. `0` means the worker has taken the job, though it can still wait for the shared pipeline lock. Terminal jobs use null. Position is also null if a queued job belongs to another process whose queue cannot be inspected.
-- `progress_percent` is a **stage-based estimate**, not measured page/item completion or an elapsed-time prediction. It remains unchanged during a long stage. Stages use 0 (queued), 1 (starting), 5 (tariff setup), 10 (model loading/reuse), 20 (OCR), 45 (cleanup), 55 (JSON extraction), 75 (retrieval), 85 (classification), and 99 (finalization). Only saved success reaches 100. Failures retain the last recorded estimate.
+- `progress_percent` is a **stage-based estimate**, not measured page/item completion or an elapsed-time prediction. It remains unchanged during a long stage. Stages use 0 (queued), 1 (starting), 10 (Qwen loading/reuse), 15 (native text checks), 18 (OCR loading when needed), 20 (OCR), 45 (text cleanup), 55 (JSON extraction), 60 (product identification), 70 (tariff setup), 75 (retrieval), 85 (classification), and 99 (finalization). Only saved success reaches 100. Failures retain the last recorded estimate.
 - `stage` is the machine-readable stage; `stage_description` explains what is processing.
 - The socket immediately sends the current snapshot and sends another at the selected interval (1–60 seconds, default 1). Intermediate stages shorter than that interval may be skipped. Repeated unchanged snapshots also keep the connection active.
 - Events are `progress`, `completed`, or `failed`, each containing `job`. Terminal events include the final result/error and close normally with code `1000`.
@@ -102,7 +102,7 @@ For connection URLs, PDF upload messages, GPU events, and complete browser/Pytho
 
 ## Start the server
 
-Install the AI and server dependencies from the repository root, using a CUDA-enabled environment with BF16 GPU support for Unlimited-OCR:
+Install the AI and server dependencies from the repository root, using a CUDA-enabled environment for Qwen. PaddleOCR also uses GPU by default; see [OCR device settings](../AI/README.md#installation):
 
 ```bash
 python -m pip install -r AI/requirements.txt -r server/requirements.txt
@@ -115,12 +115,12 @@ From another directory, supply the checkout path to Uvicorn:
 uvicorn --app-dir /workspace server.app:app --host 0.0.0.0 --port 8000
 ```
 
-Interactive API documentation is available at `http://localhost:8000/docs`. Importing the app does not load models or connect to the database. Models load on the first processing request and remain cached in that process. Use one worker per GPU unless memory is provisioned for multiple model copies.
+Interactive API documentation is available at `http://localhost:8000/docs`. Importing the app does not load models or connect to the database. Qwen3-8B loads on the first full invoice request; PaddleOCR loads only for pages without usable embedded PDF text. Loaded models remain cached in that process. The default uses Qwen and mobile PaddleOCR on the first visible GPU. See [performance and memory settings](../AI/README.md#performance-and-memory-settings) for routing rules, device configuration, token limits, and stage timings. Use one worker per GPU unless memory is provisioned for multiple model copies.
 
 Install dependencies with the same Python interpreter used to launch Uvicorn. For the existing `/workspace/server/venv` environment on the A100 host, use:
 
 ```bash
-/workspace/server/venv/bin/python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+/workspace/server/venv/bin/python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 /workspace/server/venv/bin/python -m pip install -r /workspace/AI/requirements.txt -r /workspace/server/requirements.txt
 /workspace/server/venv/bin/python -m uvicorn server.app:app --app-dir /workspace --host 0.0.0.0 --port 8000
 ```
@@ -156,36 +156,59 @@ After a timed-out download, check `GET /api/v1/models/status` before starting it
 
 ## Download and store the models
 
-**`POST /api/v1/models/download`** downloads both configured model repositories into the shared Hugging Face cache. It does not instantiate a tokenizer or model, import Torch, run inference, connect to Weaviate, or allocate GPU memory. Existing loaded models are left in memory unchanged.
+Model names and inference settings live in
+[`AI/model_config.py`](../AI/model_config.py). This includes repository revisions,
+OCR device and routing, Qwen precision, quantization, attention, and per-stage
+generation budgets. Database settings remain in `AI/config.py`. See the
+[model configuration reference](../AI/README.md#model-configuration) for each group.
+
+For example, set environment overrides before starting the server:
+
+```bash
+export QWEN_MODEL_ID="Qwen/Qwen3-8B"
+export QWEN_DEVICE="cuda:0"
+export OCR_DEVICE="gpu:0"
+bash scripts/run_server.sh --host 0.0.0.0 --port 8000
+```
+
+Restart after changing configuration. Already-loaded models remain cached until
+the process exits; the download endpoint does not replace them in memory.
+
+**`POST /api/v1/models/download`** downloads the three configured model repositories (OCR detection, OCR recognition, and Qwen) into the shared Hugging Face cache. It does not instantiate a tokenizer or model, import Torch, run inference, connect to Weaviate, or allocate GPU memory. Existing loaded models are left in memory unchanged.
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/models/download
 ```
 
-No request body or PDF is required. The request waits until both downloads finish, then returns `200` with their model IDs, resolved revisions, and absolute snapshot locations. For example (revision values abbreviated):
+No request body or PDF is required. The request waits until all three downloads finish, then returns `200` with their model IDs, resolved revisions, and absolute snapshot locations. For example (revision values abbreviated):
 
 ```json
 {
   "models": [
     {
-      "model_id": "baidu/Unlimited-OCR",
-      "revision": "ocr-commit-hash",
-      "location": "/workspace/.cache/huggingface/hub/models--baidu--Unlimited-OCR/snapshots/ocr-commit-hash"
+      "model_id": "PaddlePaddle/PP-OCRv5_mobile_det",
+      "revision": "det-commit-hash",
+      "location": "/workspace/.cache/huggingface/hub/models--PaddlePaddle--PP-OCRv5_mobile_det/snapshots/det-commit-hash"
     },
     {
-      "model_id": "Qwen/Qwen2.5-7B-Instruct",
+      "model_id": "PaddlePaddle/en_PP-OCRv5_mobile_rec",
+      "revision": "rec-commit-hash",
+      "location": "/workspace/.cache/huggingface/hub/models--PaddlePaddle--en_PP-OCRv5_mobile_rec/snapshots/rec-commit-hash"
+    },
+    {
+      "model_id": "Qwen/Qwen3-8B",
       "revision": "qwen-commit-hash",
-      "location": "/workspace/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/qwen-commit-hash"
+      "location": "/workspace/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/qwen-commit-hash"
     }
   ]
 }
 ```
 
-Repository defaults can be changed with `OCR_MODEL_ID` and `QWEN_MODEL_ID`; optional `OCR_MODEL_REVISION` and `QWEN_MODEL_REVISION` select branches, tags, or commits. The downloader and inference loaders share the same cache resolution: `HF_HUB_CACHE`, then `HUGGINGFACE_HUB_CACHE`, then `HF_HOME/hub`, then the standard XDG/home Hugging Face cache. Set environment variables before starting the server. `HF_TOKEN` is supported by the Hugging Face client if repository authentication is needed.
+Repository defaults can be changed with `OCR_DET_MODEL_ID`, `OCR_REC_MODEL_ID`, and `QWEN_MODEL_ID`; optional `OCR_DET_MODEL_REVISION`, `OCR_REC_MODEL_REVISION`, and `QWEN_MODEL_REVISION` select branches, tags, or commits. The downloader and inference loaders share the same cache resolution: `HF_HUB_CACHE`, then `HUGGINGFACE_HUB_CACHE`, then `HF_HOME/hub`, then the standard XDG/home Hugging Face cache. Set environment variables before starting the server. `HF_TOKEN` is supported by the Hugging Face client if repository authentication is needed.
 
 Downloads use Hugging Face's [`snapshot_download()`](https://huggingface.co/docs/huggingface_hub/guides/download#download-an-entire-repository) to store complete repositories, including weights, tokenizer files, configurations, and custom model code. Repeated calls reuse unchanged cached files, while checking the requested revision. Pin a commit revision to keep subsequent calls on the same snapshot. Downloading repository code does not execute it.
 
-Use `GET /api/v1/models/status` to inspect cached configurations and weights, including all shards listed in a weight index. The first invoice request still loads the cached weights into memory; later requests in the same server process reuse the loaded models. Cached files persist across server restarts. Allow enough HTTP client/proxy time for large downloads. A download failure returns `502` with a generic error and logs the exception on the server; completed files remain cached for a later retry.
+Use `GET /api/v1/models/status` to inspect cached configurations and weights, including Paddle inference configuration/weights and all Qwen shards listed in a weight index. The first invoice request still loads the cached weights into memory; later requests in the same server process reuse the loaded models. Cached files persist across server restarts. Allow enough HTTP client/proxy time for large downloads. A download failure returns `502` with a generic error and logs the exception on the server; completed files remain cached for a later retry.
 
 ## GPU availability and live usage
 
@@ -234,7 +257,7 @@ A model can occupy GPU memory while `active=false`, so `in_use` may still be tru
 
 `configuration.loaded_models.ocr` and `.qwen` describe objects cached in the API worker serving this request, not other processes. No model is loaded by monitoring. Multiple API workers each have their own model cache and one-second telemetry cache. Monitoring samples are taken on worker threads; subscribers share recent measurements instead of launching a separate monitoring process per connection.
 
-`configuration.ocr_gpu_ready` checks PyTorch CUDA availability and native BF16 hardware capability. It is not a guarantee of sufficient free VRAM, installed model files, or successful inference. BF16 is checked from NVIDIA compute capability without initializing a CUDA context. Mixed or unknown monitored GPU capabilities produce null for BF16 readiness. NVIDIA telemetry can expose physical devices hidden by `CUDA_VISIBLE_DEVICES`; PyTorch's device count and availability reflect the API process's CUDA visibility.
+`configuration.ocr_device` reports the configured Paddle device. `ocr_gpu_ready` is false for CPU OCR and null for GPU OCR, because PyTorch telemetry cannot establish Paddle runtime readiness. BF16 hardware capability remains informational and is no longer an OCR requirement. NVIDIA telemetry can expose physical devices hidden by `CUDA_VISIBLE_DEVICES`; PyTorch's device count and availability reflect the API process's CUDA visibility.
 
 Telemetry uses the read-only [NVIDIA NVML Python bindings](https://docs.nvidia.com/deploy/nvidia-smi/index.html), provided by `nvidia-ml-py` in `server/requirements.txt`. Monitoring does not allocate GPU tensors, load models, or change GPU settings. The HTTP endpoint returns `200` with availability/diagnostics on CPU-only hosts or when the NVIDIA driver is unavailable. A missing or incompatible driver cannot provide utilization metrics. A cold initial request may take longer while importing PyTorch. Neither these responses nor the socket stream expose Hugging Face tokens or the full environment.
 
@@ -357,7 +380,7 @@ Each connection handles one PDF:
 4. Receive `{"event":"processing"}` followed by progress messages such as `{"event":"progress","stage":"running_ocr"}` and `{"event":"progress","stage":"extracting_json"}`.
 5. Receive `{"event":"completed","result":{"invoices":[...]}}`. The `result` object has the same schema as the HTTP response. The server then closes normally with WebSocket code `1000`.
 
-Pipeline stages are `loading_tariff_index`, `loading_models`, `running_ocr`, `cleaning_text`, `extracting_json`, `retrieving_tariffs`, `classifying_items`, and `completed`. A `loading_models` progress message also occurs when the loader returns cached models; it does not mean model weights are reloaded. Processing runs in a worker thread while progress messages are sent on the event loop. The upload is spooled to disk above 1 MiB rather than keeping a complete large PDF in memory.
+Pipeline stages include `loading_models`, `extracting_pdf_text`, `loading_ocr_model` and `running_ocr` when needed, `cleaning_text`, `extracting_json`, `identifying_products`, `identifying_product`, `loading_tariff_index`, `retrieving_tariffs`, `classifying_items`, and `completed`. Native-only PDFs skip the OCR stages. Existing routes, event envelopes, output filenames, and invoice response fields are preserved. New stage names are additional progress values; clients should display their descriptions rather than requiring a fixed list. A `loading_models` progress message also occurs when the loader returns cached models; it does not mean model weights are reloaded. Processing runs in a worker thread while progress messages are sent on the event loop. The upload is spooled to disk above 1 MiB rather than keeping a complete large PDF in memory.
 
 Python client example (install the client with `python -m pip install "websockets>=12"`):
 
@@ -456,7 +479,7 @@ Errors return `{"detail": "..."}`. Pipeline failures are logged on the server; i
 - `GET /api/v1/invoices/jobs/{job_id}` returns progress and the final invoice JSON.
 - `GET /api/v1/health`
 - `GET /api/v1/models/status` checks local model directories and the Hugging Face cache without loading models.
-- `POST /api/v1/models/download` downloads and stores both model repositories without loading them into memory.
+- `POST /api/v1/models/download` downloads and stores all three model repositories without loading them into memory.
 - `POST /api/v1/jobs` with `{"document_path": "/absolute/invoice.pdf"}` starts an asynchronous OCR-only job and returns `202` with a job ID.
 - `GET /api/v1/jobs/{job_id}` returns OCR job status and output paths.
 - `WS /ws/jobs/{job_id}` streams OCR job lifecycle and progress events.
@@ -472,4 +495,4 @@ python -m unittest discover -s server/tests -v
 python -m unittest discover -s AI/tests -v
 ```
 
-API tests cover background acceptance before inference completes, progress polling, persisted results, interrupted workers, upload cleanup, GPU telemetry, configuration checks, CPU fallback, cached samples, and live socket events. They also exercise model download requests with mocked Hub downloads, partial weight-shard checks, multipart and WebSocket PDF uploads, progress events, chunked transfers, disconnect cleanup, PDF validation, the shared pipeline with fake models, multiple invoices, Weaviate backend selection, error responses, and the existing health/status routes. They do not require a GPU or live DB. A live end-to-end inference check still requires downloaded model weights, CUDA BF16 support, and a reachable configured retrieval backend.
+API tests cover background acceptance before inference completes, progress polling, persisted results, interrupted workers, upload cleanup, GPU telemetry, configuration checks, CPU fallback, cached samples, and live socket events. They also exercise model download requests with mocked Hub downloads, Paddle inference files, partial weight-shard checks, native-only PDF extraction without OCR, multipart and WebSocket PDF uploads, progress events, chunked transfers, disconnect cleanup, PDF validation, the shared pipeline with fake models, multiple invoices, Weaviate backend selection, error responses, and the existing health/status routes. They do not require a GPU or live DB. A live end-to-end inference check requires downloaded model weights, a compatible CUDA runtime for Qwen, and a reachable configured retrieval backend. BF16 is optional: `QWEN_COMPUTE_DTYPE=auto` selects BF16 when available and FP16 otherwise; the current default is explicit BF16.

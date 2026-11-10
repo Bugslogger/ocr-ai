@@ -19,7 +19,7 @@ curl http://localhost:8000/api/v1/invoices/jobs/JOB_ID
 For live progress on the shared Socket.IO connection, emit `invoice:subscribe` with `{job_id: "JOB_ID"}`. The plain WebSocket alternative is `/ws/invoices/jobs/JOB_ID`. On completion, the job snapshot contains the extracted JSON in `result`. This change avoids holding an HTTP request open for inference; it does not speed up OCR or model execution, and upload/validation still take time. The existing `POST /api/v1/invoices/jobs` remains available with the same background behavior.
 
 
-This document describes the current implementation in `AI/` and `server/`. The application accepts an invoice PDF, runs OCR, extracts structured invoice data with Qwen, retrieves tariff candidates, and returns classified invoice JSON. One PDF can contain multiple invoices and multiple line items.
+This document describes the current implementation in `AI/` and `server/`. The application accepts an invoice PDF, extracts native text with per-page OCR fallback, extracts structured invoice data with Qwen, retrieves tariff candidates, and returns classified invoice JSON. One PDF can contain multiple invoices and multiple line items.
 
 For web applications, use **background invoice jobs**: upload the PDF, receive a job ID after validation, then subscribe through Socket.IO for progress and the result, or poll the job API. Socket.IO uploads, HTTP uploads, and plain WebSocket extraction use the same AI pipeline.
 
@@ -30,7 +30,11 @@ workspace/
 ├── document.md                         # Architecture and complete flow (this document)
 ├── AI/
 │   ├── __init__.py
-│   ├── config.py                       # OCR/Qwen settings and Weaviate connection settings
+│   ├── config.py                       # Weaviate settings and compatibility imports
+│   ├── model_config.py                 # Model names, revisions, devices, precision, and generation settings
+│   ├── ocr.py                          # Text row/column ordering from bounding boxes
+│   ├── pdf_text.py                     # Native PDF text checks before OCR fallback
+│   ├── performance.py                  # Stage timings and pipeline correlation IDs
 │   ├── main.py                         # Shared pipeline, process-local lock, and CLI
 │   ├── model.py                        # Download-only operations and cached model loading
 │   ├── utils.py                        # Rendering, OCR, cleanup, extraction, and JSON output
@@ -125,7 +129,7 @@ The API upload paths default to **Weaviate**. The CLI defaults to **catalog** re
 | POST | `/api/v1/invoices/extract` | Upload PDF; return `202` job by default; `?wait=true` waits for JSON |
 | WebSocket | `/ws/invoices/jobs/{job_id}` | Monitor job ID, estimated progress, queue position, and final result |
 | WebSocket | `/ws/invoices/extract` | Upload PDF bytes, receive progress and final JSON |
-| POST | `/api/v1/models/download` | Download both model repositories to disk; no body required |
+| POST | `/api/v1/models/download` | Download OCR detection, recognition, and Qwen repositories; no body required |
 | GET | `/api/v1/models/status` | Inspect local cached weights without loading models |
 | GET | `/api/v1/gpu/status` | Read GPU availability, usage, and runtime configuration |
 | WebSocket | `/ws/gpu?interval=2` | Stream GPU/configuration samples every two seconds |
@@ -181,7 +185,7 @@ For a frontend running on a different origin, set the allowed frontend origins *
 export SOCKETIO_ALLOWED_ORIGINS='http://localhost:3000,http://localhost:5173,https://your-frontend.example'
 ```
 
-The default is same-origin checking. Origins include scheme and port, without a path or trailing slash. This setting configures the Socket.IO transport; it does not add CORS middleware for browser REST calls. Use one server process per GPU with the existing process-local queue and model cache.
+The default allowed Socket.IO origin is `https://dev.admin.logistx.us`; an explicitly empty `SOCKETIO_ALLOWED_ORIGINS` restores same-origin checking. Origins include scheme and port, without a path or trailing slash. This variable controls Socket.IO only; REST CORS is separately configured in `server/app.py` to permit `https://dev.admin.logistx.us`. Use one server process per GPU with the existing process-local queue and model cache.
 
 Install the browser client in your frontend project:
 
@@ -412,10 +416,14 @@ stateDiagram-v2
 | `queued` | Waiting in the background job queue |
 | `starting` | Worker has taken the job; may still wait for the pipeline lock |
 | `loading_tariff_index` | Initialize retrieval backend and country mapping |
-| `loading_models` | Load model objects if needed, otherwise reuse cached objects |
-| `running_ocr` | Render PDF pages and run OCR |
+| `loading_models` | Load or reuse Qwen |
+| `extracting_pdf_text` | Check native PDF text per page |
+| `loading_ocr_model` | Load or reuse PaddleOCR only when needed |
+| `running_ocr` | Recognize fallback page images with PaddleOCR |
 | `cleaning_text` | Remove OCR markup while preserving useful structure |
 | `extracting_json` | Generate and validate structured invoice data |
+| `identifying_products` / `identifying_product` | Build product profiles and search queries when lookup is needed |
+| `loading_product_model` | Load or reuse Qwen for standalone product identification |
 | `retrieving_tariffs` | Fetch tariff candidates for each invoice item |
 | `classifying_items` | Select candidates, validate codes, and attach review flags |
 | `completed` | Pipeline finished; final background status becomes `succeeded` after response validation and persistence |
@@ -501,7 +509,7 @@ Example event while waiting:
 ```
 
 - `queue_position`: `1` is the next waiting job; `2` means one waiting job is ahead, plus any job already processing. `0` means the worker has taken the job, though it can still wait for the shared pipeline lock. Terminal jobs use null. Position is also null if a queued job belongs to another process whose queue cannot be inspected.
-- `progress_percent` is a **stage-based estimate**, not measured page/item completion or an elapsed-time prediction. It remains unchanged during a long stage. Stages use 0 (queued), 1 (starting), 5 (tariff setup), 10 (model loading/reuse), 20 (OCR), 45 (cleanup), 55 (JSON extraction), 75 (retrieval), 85 (classification), and 99 (finalization). Only saved success reaches 100. Failures retain the last recorded estimate.
+- `progress_percent` is a **stage-based estimate**, not measured page/item completion or an elapsed-time prediction. It remains unchanged during a long stage. Stages use 0 (queued), 1 (starting), 10 (Qwen loading/reuse), 15 (native text checks), 18 (OCR loading when needed), 20 (OCR), 45 (text cleanup), 55 (JSON extraction), 60 (product identification), 70 (tariff setup), 75 (retrieval), 85 (classification), and 99 (finalization). Only saved success reaches 100. Failures retain the last recorded estimate.
 - `stage` is the machine-readable stage; `stage_description` explains what is processing.
 - The socket immediately sends the current snapshot and sends another at the selected interval (1–60 seconds, default 1). Intermediate stages shorter than that interval may be skipped. Repeated unchanged snapshots also keep the connection active.
 - Events are `progress`, `completed`, or `failed`, each containing `job`. Terminal events include the final result/error and close normally with code `1000`.
@@ -515,22 +523,23 @@ Example event while waiting:
 ```mermaid
 flowchart TD
     PDF[Validated PDF] --> Lock[Acquire PIPELINE_LOCK]
-    Lock --> Backend{Retrieval backend}
-    Backend -->|weaviate| DB[Connect to Weaviate and load country mapping]
-    Backend -->|catalog| Catalog[Load HS catalog and optional national overlays]
-    DB --> Models[Load or reuse OCR and Qwen models]
-    Catalog --> Models
-    Models --> Render[Render all PDF pages with PyMuPDF]
-    Render --> OCR[Unlimited-OCR infer_multi]
-    OCR --> Raw[Write raw OCR text]
-    Raw --> Clean[Clean markup and preserve table boundaries]
-    Clean --> Extract[Qwen extracts all invoices and items]
-    Extract --> Schema{Extraction passes JSON Schema?}
+    Lock --> Models[Load or reuse Qwen3-8B]
+    Models --> Native[Extract and check native PDF text per page]
+    Native --> Usable{Usable native text without large images}
+    Usable -->|Yes| Combine[Combine pages in document order]
+    Usable -->|No| Render[Render only pages needing OCR]
+    Render --> OCR[Lazy PaddleOCR mobile detection and English recognition]
+    OCR --> Combine
+    Combine --> Clean[Save and clean ordered text]
+    Clean --> Extract[Qwen extracts invoices and items]
+    Extract --> Schema{Extraction passes JSON Schema}
     Schema -->|No| Error[Fail request or job]
-    Schema -->|Yes| Candidates[Retrieve candidates for each invoice and item]
-    Candidates --> Select[Qwen selects HS6 and national candidates]
-    Select --> Check[Validate candidate membership and HS6 prefixes]
-    Check --> Evidence[Preserve invoice code evidence and set review flags]
+    Schema -->|Yes| Missing{Tariff codes need lookup}
+    Missing -->|Yes| Products[Identify products and prepare retrieval backend]
+    Products --> Candidates[Retrieve candidates for incomplete items]
+    Missing -->|No| Evidence[Preserve invoice code evidence and set review flags]
+    Candidates --> Select[Qwen selects and validates tariff candidates]
+    Select --> Evidence
     Evidence --> Final[Write and return final classification JSON]
     Final --> Cleanup[Close DB connection and release lock]
     Error --> Cleanup
@@ -540,16 +549,16 @@ The diagram shows the extraction schema failure path. Other exceptions also trig
 
 ### Processing details
 
-1. **Lock and retrieval setup:** `doc_pipeline()` acquires the process-local `PIPELINE_LOCK`. In Weaviate mode it opens the database connection and loads the country-to-database mapping from `https://bapi.logistx.us/his_countries`. In catalog mode it loads reference data.
-2. **Models:** `download_models()` obtains cached OCR and Qwen bundles. Despite the function name, it loads model objects when they are missing; it differs from the download-only REST endpoint.
-3. **OCR:** PyMuPDF renders every PDF page using the configured DPI. Unlimited-OCR returns raw text. Page images are temporary and removed after use.
-4. **Cleaning:** markup and detection coordinates are removed while useful table boundaries and page breaks are preserved. Empty OCR output fails processing.
-5. **Extraction:** Qwen extracts invoice, shipment, and line-item fields using the shared schema. Missing values are null. Country of manufacture must come from product evidence rather than being copied from the sender address.
-6. **Schema validation:** malformed JSON, incorrect field types, unexpected or missing fields, empty invoice lists, and empty item lists fail extraction.
-7. **Retrieval:** candidates are indexed by `(invoice_index, item_index)`. Duplicate or missing SKUs therefore do not overwrite other items. Weaviate uses country-filtered BM25; catalog mode uses text matching and optional national overlays.
-8. **Classification:** Qwen selects from retrieved candidates. National codes must belong to the correct country's candidates and extend the selected HS6. Invalid selections are rejected. An individual classification failure becomes a reviewable item so other items can continue.
-9. **Evidence and result:** invoice-supplied tariff codes are retained as evidence and flagged for review. Final classified invoices are returned to the API adapter.
-10. **Cleanup:** the pipeline closes an opened Weaviate connection in `finally`. The API processor removes its temporary upload and intermediate output directory when it exits.
+1. **Lock and model setup:** `doc_pipeline()` acquires the process-local `PIPELINE_LOCK` and loads or reuses Qwen3-8B on the configured GPU with optional 4-bit quantization. PaddleOCR is not loaded yet.
+2. **Native text first:** PyMuPDF reads words and bounding boxes per page. Pages must meet the configured text threshold and quality checks and contain less than 10% image area; otherwise they use OCR. This heuristic cannot prove native text matches the visible page. Set `PDF_TEXT_FIRST=false` to force OCR.
+3. **OCR fallback:** only fallback pages are rendered at 250 DPI by default. PaddleOCR loads `PP-OCRv5_mobile_det` and `en_PP-OCRv5_mobile_rec` lazily, on GPU by default. Optional orientation and unwarping models are disabled. Text is grouped into rows with tabs between cells. Page images are temporary and removed on success or failure.
+4. **Cleaning:** native and recognized text are combined in page order, with page separators and column boundaries preserved. Empty or malformed OCR page results fail processing rather than returning a partial invoice.
+5. **Extraction:** Qwen extracts invoice, shipment, and line-item fields using the shared schema, with thinking disabled. Missing values are null. Country of manufacture must come from product evidence rather than the sender address.
+6. **Schema validation:** missing data fields are normalized to null; malformed JSON, incorrect supplied types, unexpected fields, empty invoice lists, and empty item lists fail extraction.
+7. **Product identification and retrieval:** if tariff lookup is needed, Qwen creates product profiles/search terms. Only then is the configured catalog or Weaviate backend opened. Weaviate uses the country mapping API and country-filtered BM25 plus code-prefix retrieval. Candidate records use `(invoice_index, item_index)` so duplicate or missing SKUs cannot overwrite other items. Complete invoice-supplied codes skip retrieval/classification for that item.
+8. **Classification:** Qwen selects only retrieved candidates. National codes must belong to the appropriate country and extend the selected HS6. Invalid selections are rejected; individual classification failures become reviewable items.
+9. **Evidence and result:** invoice-supplied tariff codes remain evidence flagged for review. Final data retains the `invoices[]` structure, including `order_level`, `item_level`, and `shipment`.
+10. **Cleanup and timings:** opened database connections close in `finally`, locks release, and the API processor removes its temporary upload/output directory. Each processing stage emits a correlated `performance` log with duration and status; Qwen decode also records token counts and GPU allocated/reserved memory. See [performance settings](AI/README.md#performance-and-memory-settings).
 
 ### Output hierarchy
 
@@ -686,13 +695,13 @@ flowchart TD
     Empty --> Lookup
 ```
 
-- Default OCR: `baidu/Unlimited-OCR`.
-- Default extraction/classification: `Qwen/Qwen2.5-7B-Instruct`.
+- Detection: `PaddlePaddle/PP-OCRv5_mobile_det`; recognition: `PaddlePaddle/en_PP-OCRv5_mobile_rec`.
+- Extraction, product identification, and classification: `Qwen/Qwen3-8B`.
 - `POST /api/v1/models/download` stores repository files without instantiating models or loading them into GPU memory. It is synchronous and can itself exceed a proxy timeout during large downloads.
 - `GET /api/v1/models/status` checks cached weight files, including indexed shards. Downloaded files do not imply models are loaded or GPU-ready.
 - Models initialize lazily on first use and remain cached for the life of the process. Startup and rejected uploads do not load them.
 - A restart or development reload clears the model objects. Loading happens again on the next request, using cached files when available.
-- Unlimited-OCR requires CUDA and BF16 support in this implementation. Qwen CPU support alone does not make the complete pipeline CPU-compatible.
+- PaddleOCR uses `gpu:0` by default, sharing the GPU with Qwen on `cuda:0`. Qwen requires CUDA; `QWEN_COMPUTE_DTYPE=auto` uses BF16 when supported and FP16 otherwise; the current default explicitly selects BF16. Native-only PDFs skip Paddle model loading entirely.
 
 ## 10. GPU monitoring and configuration checks
 
@@ -735,9 +744,10 @@ For a successful CLI run, the output directory contains:
 
 ```text
 <output-directory>/
-├── detailed_invoice_output.txt         # Raw OCR
-├── plain_invoice_text.txt              # Cleaned OCR
+├── detailed_invoice_output.txt         # Combined native/OCR text with page separators
+├── plain_invoice_text.txt              # Cleaned native/OCR text
 ├── extracted_invoice.json              # Validated extraction before classification
+├── product_identification.json         # Product profiles when tariff lookup is needed
 ├── db_matches.json                     # Retrieved per-item candidates
 └── final_classification.json           # Final returned result
 ```
@@ -746,22 +756,26 @@ For a successful CLI run, the output directory contains:
 
 | Setting | Default / behavior |
 | --- | --- |
-| `SOCKETIO_ALLOWED_ORIGINS` | Comma-separated frontend origins; default same-origin Socket.IO checking |
+| `SOCKETIO_ALLOWED_ORIGINS` | Comma-separated Socket.IO origins; default `https://dev.admin.logistx.us`; an explicitly empty value restores same-origin checking |
 | `INVOICE_TARIFF_BACKEND` | `weaviate` for API uploads; alternative `catalog` |
 | `WEAVIATE_HOST` | `32.236.127.40`; no database API key is required |
 | `WEAVIATE_HTTP_PORT` / `WEAVIATE_GRPC_PORT` | `8080` / `50051` |
 | `WEAVIATE_HTTP_SECURE` / `WEAVIATE_GRPC_SECURE` | `false` / `false` |
 | `INVOICE_MAX_UPLOAD_BYTES` | `26214400` bytes, or 25 MiB |
 | `INVOICE_JOB_DIR` | `<repository>/output/invoice_jobs` |
-| `OCR_MODEL_ID` / `QWEN_MODEL_ID` | Override default repositories |
-| `OCR_MODEL_REVISION` / `QWEN_MODEL_REVISION` | Optional model revision pins |
+| `OCR_DET_MODEL_ID` / `OCR_REC_MODEL_ID` / `QWEN_MODEL_ID` | Override detection, recognition, and Qwen repositories |
+| `OCR_DET_MODEL_REVISION` / `OCR_REC_MODEL_REVISION` / `QWEN_MODEL_REVISION` | Optional model revision pins |
 | `HF_HUB_CACHE` / `HUGGINGFACE_HUB_CACHE` | Explicit model cache path, in that precedence order |
 | `HF_HOME` | Hugging Face home; cache uses its `hub` directory when no explicit cache path is set |
 | `HF_TOKEN` | Optional Hugging Face access token; configure outside source files |
 | `HS_CATALOG_PATH` | Optional local HS CSV for catalog mode |
 | `NATIONAL_INDEX_PATH` | Optional national tariff overlay JSON for catalog mode |
 
-Current inference settings in `AI/config.py`: OCR image size `1024`, DPI `350`, OCR max length `15000`; Qwen max new tokens `8000` and temperature `0.0`.
+Model configuration is centralized in [`AI/model_config.py`](AI/model_config.py), separate from database settings in `AI/config.py`. It contains model names/revisions, cache defaults, OCR routing and device settings, Qwen device/precision, NF4 quantization, SDPA attention, chat formatting, and generation budgets. See the [full configuration reference](AI/README.md#model-configuration).
+
+Defaults: native PDF text first; OCR at 250 DPI on `gpu:0` with recognition batches of 32; Qwen3-8B on `cuda:0` with BF16 compute by default, optional 4-bit double quantization (currently disabled), thinking disabled, and a 32,768-token accepted context budget. Generation ceilings are 15,000 tokens for extraction, 1,000 for product identification, 700 for classification, and 8,000 for direct generator calls; temperature defaults to 0.0. These ceilings do not force generation of that many tokens.
+
+Supported runtime overrides include `PDF_TEXT_FIRST`, `PDF_TEXT_MIN_CHARS`, `OCR_DEVICE`, `OCR_DPI`, `OCR_RECOGNITION_BATCH_SIZE`, `QWEN_DEVICE`, `QWEN_COMPUTE_DTYPE`, `QWEN_MAX_CONTEXT_TOKENS`, and `QWEN_MAX_NEW_TOKENS`. Environment overrides take precedence where configured. Set them before startup and restart the worker after changes; downloading model files does not replace already-loaded models. Existing `Qconfig`, `Qruntime`, and `Oconfig` imports remain compatible aliases.
 
 Weaviate requires a reachable HTTP and gRPC connection and an `Hs_category` collection with `country_code`, `code`, `description`, and `indent`. The country mapping API is a separate network dependency. In catalog mode, an absent local catalog triggers a runtime catalog download. Model files and tariff reference data are separate resources.
 
@@ -791,7 +805,7 @@ Check API health
                     └── failed    → display error and inspect server logs
 ```
 
-API success does not imply all external dependencies are healthy. First processing must still reach its retrieval backend and successfully load/run the models. Browser deployments also need their own permitted-origin/authentication setup as appropriate; the current application does not configure CORS middleware or user authentication.
+API success does not imply all external dependencies are healthy. First processing must still reach its retrieval backend and successfully load/run the models. Browser deployments also need their own permitted-origin/authentication setup as appropriate; the current application allows REST requests from `https://dev.admin.logistx.us` and uses that origin as the default Socket.IO allowlist. `SOCKETIO_ALLOWED_ORIGINS` changes Socket.IO only. User authentication is not implemented.
 
 ## 14. Failure handling and limits
 

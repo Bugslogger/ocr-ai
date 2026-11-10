@@ -14,7 +14,11 @@ from AI.main import doc_pipeline
 from AI.schema import ORDER_FIELDS, ITEM_FIELDS, NUMBER_FIELDS
 from AI.tariff import (CatalogRetriever, WeaviateRetriever, classify_item,
                        iso2_from_country, validate_selection)
-from AI.utils import clean_ocr_text, extract_doc, format_json, qwen_generate, _ocr_call, pdf_to_images
+from AI.utils import clean_ocr_text, extract_doc, format_json, qwen_generate, pdf_to_images
+
+
+def ocr_result(text):
+    return {"rec_texts": [text], "rec_boxes": [[0, 0, 200, 20]]}
 
 
 def invoice(sku="DUPLICATE"):
@@ -313,40 +317,6 @@ class ExternalBoundaryTests(TestCase):
         self.assertEqual({call.kwargs["filters"].value for call in query.bm25.call_args_list}, {"41", "14"})
         self.assertEqual({call.kwargs["filters"].filters[0].value for call in query.fetch_objects.call_args_list}, {"41", "14"})
 
-    def test_ocr_generation_supplies_mask_pad_and_respects_configured_limit(self):
-        import torch
-
-        class Model:
-            config = SimpleNamespace(sliding_window=128)
-            def generate(self, **options):
-                self.options = options
-                return "generated"
-            def infer(self, tokenizer):
-                return self.generate(input_ids=torch.tensor([[0, 1, 7]]), max_length=15000)
-        model = Model()
-        tokenizer = SimpleNamespace(pad_token_id=None, eos_token_id=1)
-        self.assertEqual(_ocr_call(model, model.infer, tokenizer), "generated")
-        self.assertEqual(model.options["attention_mask"].tolist(), [[1, 1, 1]])
-        self.assertEqual(model.options["pad_token_id"], 1)
-        self.assertIsNone(model.options["max_new_tokens"])
-        self.assertEqual(model.options["max_length"], 15000)
-        self.assertNotIn("generate", vars(model))
-
-    def test_ocr_generate_method_is_restored_after_exception(self):
-        class Model:
-            config = SimpleNamespace(sliding_window=128)
-            def generate(self, **options):
-                raise RuntimeError("Generation failed")
-            def infer(self, tokenizer):
-                self.config.sliding_window = None
-                self.config._ring_window = 128
-                return self.generate(max_length=10)
-        model = Model()
-        with self.assertRaisesRegex(RuntimeError, "Generation failed"):
-            _ocr_call(model, model.infer, SimpleNamespace(eos_token_id=1))
-        self.assertNotIn("generate", vars(model))
-        self.assertEqual(model.config.sliding_window, 128)
-        self.assertFalse(hasattr(model.config, "_ring_window"))
 
     def test_nz_database_rows_keep_check_letters_and_parent_context(self):
         query = Mock()
@@ -480,19 +450,71 @@ class ExternalBoundaryTests(TestCase):
         model.generate.return_value = torch.tensor([[1, 2, 3, 4, 5, 6, 9]])
         tokenizer.decode.return_value = '{"ok":true}'
         self.assertEqual(qwen_generate([], tokenizer, model, max_new_tokens=4), '{"ok":true}')
+        tokenizer.apply_chat_template.assert_called_with(
+            [], tokenize=False, add_generation_prompt=True, enable_thinking=False)
 
-    def test_ocr_loader_fails_before_download_on_cpu(self):
+    def test_qwen_8b_is_quantized_on_one_gpu_and_cached(self):
         import torch
-        from AI import model as model_module
-        # Transformers need not be installed to check the CPU failure path.
-        fake_transformers = ModuleType("transformers")
-        fake_transformers.AutoModel = Mock()
-        fake_transformers.AutoTokenizer = Mock()
-        with patch.dict(sys.modules, {"transformers": fake_transformers}), patch.dict(model_module._models, {}, clear=True), patch("torch.cuda.is_available", return_value=False):
-            with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
-                model_module.download_ocr()
-            fake_transformers.AutoModel.from_pretrained.assert_not_called()
-            fake_transformers.AutoTokenizer.from_pretrained.assert_not_called()
+        from AI import model as module
+        from AI.config import Qruntime
+        from AI.model_config import QWEN_QUANTIZATION_CONFIG
+        transformers = ModuleType("transformers")
+        transformers.AutoModelForCausalLM = Mock()
+        transformers.AutoTokenizer = Mock()
+        transformers.BitsAndBytesConfig = Mock()
+        with patch.dict(sys.modules, {"transformers": transformers}), patch.dict(module._models, {}, clear=True), patch(
+            "torch.cuda.is_available", return_value=True
+        ), patch("torch.cuda.is_bf16_supported", return_value=False), patch.dict(
+            QWEN_QUANTIZATION_CONFIG, {"load_in_4bit": True}
+        ), patch.dict(Qruntime, {"device": "cuda:0", "compute_dtype": "auto"}):
+            first = module.download_qwen()
+            self.assertIs(first, module.download_qwen())
+        options = transformers.AutoModelForCausalLM.from_pretrained.call_args.kwargs
+        self.assertEqual(transformers.AutoModelForCausalLM.from_pretrained.call_args.args[0], "Qwen/Qwen3-8B")
+        self.assertEqual(options["device_map"], {"": "cuda:0"})
+        self.assertEqual(options["attn_implementation"], "sdpa")
+        transformers.BitsAndBytesConfig.assert_called_once_with(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True)
+        transformers.AutoModelForCausalLM.from_pretrained.assert_called_once()
+
+    def test_ocr_loader_uses_exact_models_and_caches_pipeline(self):
+        from AI import model as module
+        from AI.config import Oconfig
+        paddleocr = ModuleType("paddleocr")
+        paddleocr.PaddleOCR = Mock()
+        with patch.dict(sys.modules, {"paddleocr": paddleocr}), patch.dict(module._models, {}, clear=True), patch(
+            "huggingface_hub.snapshot_download", side_effect=["/det", "/rec"]
+        ) as download, patch.dict(Oconfig, {"device": "gpu:0"}):
+            first = module.download_ocr()
+            self.assertIs(first, module.download_ocr())
+            self.assertEqual(download.call_count, 2)
+        options = paddleocr.PaddleOCR.call_args.kwargs
+        self.assertEqual(options["text_detection_model_name"], "PP-OCRv5_mobile_det")
+        self.assertEqual(options["text_recognition_model_name"], "en_PP-OCRv5_mobile_rec")
+        self.assertEqual(options["device"], "gpu:0")
+        self.assertFalse(options["use_doc_orientation_classify"])
+        self.assertFalse(options["use_doc_unwarping"])
+        self.assertFalse(options["use_textline_orientation"])
+        self.assertEqual(first, {"ocr_model": paddleocr.PaddleOCR.return_value})
+
+    def test_qwen_full_precision_gpu_loading_honors_disabled_quantization(self):
+        from AI import model as module
+        from AI.model_config import QWEN_QUANTIZATION_CONFIG, Qruntime
+        transformers = ModuleType("transformers")
+        transformers.AutoModelForCausalLM = Mock()
+        transformers.AutoTokenizer = Mock()
+        transformers.BitsAndBytesConfig = Mock()
+        with patch.dict(sys.modules, {"transformers": transformers}), patch.dict(module._models, {}, clear=True), patch(
+            "torch.cuda.is_available", return_value=True
+        ), patch.dict(QWEN_QUANTIZATION_CONFIG, {"load_in_4bit": False, "load_in_8bit": False}), patch.dict(
+            Qruntime, {"device": "cuda:0", "compute_dtype": "bfloat16"}
+        ):
+            module.download_qwen()
+        transformers.BitsAndBytesConfig.assert_not_called()
+        options = transformers.AutoModelForCausalLM.from_pretrained.call_args.kwargs
+        self.assertNotIn("quantization_config", options)
+        self.assertEqual(options["device_map"], {"": "cuda:0"})
 
 
 class PipelineTests(TestCase):
@@ -521,8 +543,8 @@ class PipelineTests(TestCase):
                 doc.save(pdf)
             model = Mock()
             with self.assertLogs("AI.utils", level="WARNING"), self.assertRaisesRegex(ValueError, "compressed-stream decoding error"):
-                extract_doc(pdf, Path(folder) / "out", {"ocr_model": model, "ocr_tokenizer": None})
-            model.infer_multi.assert_not_called()
+                extract_doc(pdf, Path(folder) / "out", {"ocr_model": model})
+            model.predict.assert_not_called()
             self.assertFalse(list((Path(folder) / "out").glob("pages_*")))
 
     def test_expanded_order_fields_are_extracted_without_changing_values(self):
@@ -675,17 +697,17 @@ class PipelineTests(TestCase):
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
             model = Mock()
-            model.infer_multi.return_value = ("<PAGE>Invoice data", 2)
+            model.predict.return_value = [ocr_result("Invoice data")]
             output = Path(folder) / "output"
-            with patch("AI.model.download_ocr", return_value={"ocr_model": model, "ocr_tokenizer": None}), patch(
+            with patch("AI.model.download_ocr", return_value={"ocr_model": model}), patch(
                 "AI.model.download_qwen"
             ) as load_qwen:
                 result = DocumentProcessor().process(pdf, output, lambda stage: None)
             load_qwen.assert_not_called()
-            self.assertEqual(Path(result["plain_text_path"]).read_text(), "Invoice data")
+            self.assertEqual(Path(result["plain_text_path"]).read_text(), "Invoice data\nInvoice data")
 
     def test_import_and_help_have_no_model_or_network_side_effects(self):
-        code = "import sys; import AI.main; assert 'torch' not in sys.modules; assert 'transformers' not in sys.modules; assert 'weaviate' not in sys.modules"
+        code = "import sys; import AI.main; assert 'torch' not in sys.modules; assert 'transformers' not in sys.modules; assert 'weaviate' not in sys.modules; assert 'paddleocr' not in sys.modules; assert 'paddle' not in sys.modules"
         subprocess.run([sys.executable, "-c", code], check=True)
         subprocess.run([sys.executable, "-m", "AI.main", "--help"], check=True, stdout=subprocess.DEVNULL)
 
@@ -699,53 +721,35 @@ class PipelineTests(TestCase):
             make_pdf(pdf)
             output = Path(folder) / "output"
             model = Mock()
-            model.infer_multi.return_value = ("<PAGE>invoice data", 8)
-            text = extract_doc(pdf, output, {"ocr_model": model, "ocr_tokenizer": object()})
-            self.assertEqual(text, "<PAGE>invoice data")
-            self.assertEqual(len(model.infer_multi.call_args.kwargs["image_files"]), 2)
-            self.assertFalse(model.infer_multi.call_args.kwargs["save_results"])
-            model.infer.assert_not_called()
-            self.assertFalse(list(output.glob("pages_*")))
+            model.predict.side_effect = [[ocr_result("Invoice one")], [ocr_result("Invoice two")]]
+            text = extract_doc(pdf, output, {"ocr_model": model})
+            self.assertEqual(text, "Invoice one\n<PAGE>\nInvoice two")
+            self.assertEqual(model.predict.call_count, 2)
+            paths = [c.kwargs["input"] for c in model.predict.call_args_list]
+            self.assertTrue(paths[0].endswith("page_0001.png"))
+            self.assertTrue(paths[1].endswith("page_0002.png"))
+            self.assertFalse(any(Path(path).exists() for path in paths))
+            self.assertEqual((output / "detailed_invoice_output.txt").read_text(), text)
 
     def test_failed_ocr_cleans_temporary_pages(self):
         with TemporaryDirectory() as folder:
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
             model = Mock()
-            model.infer_multi.side_effect = RuntimeError("inference failed")
+            model.predict.side_effect = RuntimeError("inference failed")
             with self.assertRaisesRegex(RuntimeError, "inference failed"):
-                extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
+                extract_doc(pdf, folder, {"ocr_model": model})
             self.assertFalse(list(Path(folder).glob("pages_*")))
 
-    def test_empty_multi_page_ocr_retries_every_page_in_order(self):
+
+    def test_empty_page_reports_page_and_does_not_persist_partial_invoice(self):
         with TemporaryDirectory() as folder:
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
             model = Mock()
-            model.infer_multi.return_value = ("<PAGE>\n", 1)
-            model.infer.side_effect = ["Invoice first page", "Invoice second page"]
-            with self.assertLogs("AI.utils", level="WARNING"):
-                raw = extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
-            self.assertEqual(raw, "Invoice first page\n<PAGE>\nInvoice second page")
-            self.assertEqual(model.infer_multi.call_args.kwargs["prompt"], "<image>Document parsing.")
-            self.assertEqual(model.infer.call_count, 2)
-            calls = model.infer.call_args_list
-            self.assertTrue(calls[0].kwargs["eval_mode"])
-            self.assertTrue(calls[0].kwargs["crop_mode"])
-            self.assertTrue(calls[0].kwargs["image_file"].endswith("page_0001.png"))
-            self.assertTrue(calls[1].kwargs["image_file"].endswith("page_0002.png"))
-            self.assertEqual((Path(folder) / "detailed_invoice_output.txt").read_text(), raw)
-            self.assertFalse(list(Path(folder).glob("pages_*")))
-
-    def test_empty_retry_reports_page_and_does_not_persist_partial_invoice(self):
-        with TemporaryDirectory() as folder:
-            pdf = Path(folder) / "invoice.pdf"
-            make_pdf(pdf)
-            model = Mock()
-            model.infer_multi.return_value = ("", 0)
-            model.infer.side_effect = ["Page one", ""]
-            with self.assertLogs("AI.utils", level="WARNING"), self.assertRaisesRegex(RuntimeError, "page 2/2"):
-                extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
+            model.predict.side_effect = [[ocr_result("Page one")], [{"rec_texts": [], "rec_boxes": []}]]
+            with self.assertRaisesRegex(RuntimeError, "page 2/2"):
+                extract_doc(pdf, folder, {"ocr_model": model})
             self.assertFalse((Path(folder) / "detailed_invoice_output.txt").exists())
             self.assertFalse(list(Path(folder).glob("pages_*")))
 
@@ -754,55 +758,11 @@ class PipelineTests(TestCase):
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
             model = Mock()
-            model.infer_multi.return_value = {"text": "Unsupported"}
-            with self.assertRaisesRegex(RuntimeError, "Unsupported OCR return type: dict"):
-                extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
-            model.infer.assert_not_called()
+            model.predict.return_value = [{"text": "Unsupported"}]
+            with self.assertRaisesRegex(RuntimeError, "matching rec_texts and rec_boxes"):
+                extract_doc(pdf, folder, {"ocr_model": model})
             self.assertFalse(list(Path(folder).glob("pages_*")))
 
-    def test_ocr_restores_settings_after_failure_before_next_document(self):
-        with TemporaryDirectory() as folder:
-            pdf = Path(folder) / "invoice.pdf"
-            make_pdf(pdf)
-            model = Mock()
-            model.config = SimpleNamespace(sliding_window=128)
-            def infer(*args, **kwargs):
-                self.assertEqual(model.config.sliding_window, 128)
-                self.assertFalse(hasattr(model.config, "_ring_window"))
-                model.config.sliding_window = None
-                model.config._ring_window = 128
-                if model.infer_multi.call_count == 1:
-                    raise RuntimeError("First request failed during generation")
-                return "Second invoice", 2
-            model.infer_multi.side_effect = infer
-            bundle = {"ocr_model": model, "ocr_tokenizer": None}
-            with self.assertRaisesRegex(RuntimeError, "First request failed"):
-                extract_doc(pdf, Path(folder) / "first", bundle)
-            self.assertEqual(model.config.sliding_window, 128)
-            self.assertFalse(hasattr(model.config, "_ring_window"))
-            self.assertEqual(extract_doc(pdf, Path(folder) / "second", bundle), "Second invoice")
-            self.assertEqual(model.config.sliding_window, 128)
-            self.assertFalse(hasattr(model.config, "_ring_window"))
-
-    def test_ocr_commentary_retries_and_is_never_passed_to_extraction(self):
-        commentary = ('The Ground Truth image displays a single solid horizontal line. '
-                      'According to Rule 2, the provided OCR result is incorrect.')
-        with TemporaryDirectory() as folder:
-            pdf = Path(folder) / "invoice.pdf"
-            make_pdf(pdf)
-            model = Mock()
-            model.infer_multi.return_value = (commentary, 40)
-            model.infer.side_effect = ["Invoice first page", "Invoice second page"]
-            with self.assertLogs("AI.utils", level="WARNING"):
-                raw = extract_doc(pdf, folder, {"ocr_model": model, "ocr_tokenizer": None})
-            self.assertNotIn("Ground Truth", raw)
-            self.assertIn("Invoice first page", raw)
-            self.assertEqual(model.infer.call_count, 2)
-            model.infer.side_effect = None
-            model.infer.return_value = commentary
-            with self.assertLogs("AI.utils", level="WARNING"), self.assertRaisesRegex(RuntimeError, "evaluation commentary"):
-                extract_doc(pdf, Path(folder) / "bad", {"ocr_model": model, "ocr_tokenizer": None})
-            self.assertFalse((Path(folder) / "bad" / "detailed_invoice_output.txt").exists())
 
     def test_table_cell_boundaries_preserved(self):
         self.assertEqual(clean_ocr_text("<tr><td>sku</td><td>42</td></tr>"), "sku\t42")
@@ -813,22 +773,23 @@ class PipelineTests(TestCase):
         selections = [json.dumps({"hs6": code, "destination_national_code": national,
                                   "needs_review": False, "confidence": "MEDIUM"})
                       for code, national in [("854442", "8544.42.00.00"), ("854449", None), ("854442", None)]]
-        generate = Mock(side_effect=[json.dumps(parsed), *selections])
+        profiles = [json.dumps({"product_type": "insulated electric cable", "needs_review": False})] * 3
+        generate = Mock(side_effect=[json.dumps(parsed), *profiles, *selections])
         with TemporaryDirectory() as folder:
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
             output = Path(folder) / "output"
             ocr = Mock()
-            ocr.infer_multi.return_value = ("<PAGE>Invoice one\n<PAGE>Invoice two", 10)
+            ocr.predict.return_value = [ocr_result("Invoice text")]
             stages = []
-            result = doc_pipeline(pdf, output, models={"ocr": {"ocr_model": ocr, "ocr_tokenizer": None}},
+            result = doc_pipeline(pdf, output, models={"ocr": {"ocr_model": ocr}},
                                   generate=generate, retriever=CatalogRetriever(ROWS, NATIONAL), progress=stages.append)
             self.assertEqual(result["invoices"][0]["item_level"][0]["hs6_code"], "854442")
             self.assertEqual(result["invoices"][1]["item_level"][0]["hs6_code"], "854449")
             self.assertEqual(result["invoices"][1]["item_level"][1]["hs6_code"], "854442")
             matches = json.loads((output / "db_matches.json").read_text())
             self.assertEqual([(m["invoice_index"],m["item_index"]) for m in matches], [(0,0),(1,0),(1,1)])
-            self.assertEqual(generate.call_count, 4)
+            self.assertEqual(generate.call_count, 7)
             self.assertEqual(stages[-1], "completed")
             self.assertEqual(json.loads((output / "final_classification.json").read_text()), result)
             # Extraction evidence must remain separate from classification mutations.

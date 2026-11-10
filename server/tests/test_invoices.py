@@ -72,17 +72,17 @@ class InvoiceUploadTests(TestCase):
     def test_api_runs_real_pipeline_with_fake_models(self):
         payload = extracted_result()
         payload["invoices"].append(deepcopy(payload["invoices"][0]))
-        generate = Mock(side_effect=[json.dumps(payload), *[
+        generate = Mock(side_effect=[json.dumps(payload), *[json.dumps({"product_type": "electric cable", "needs_review": False})] * 2, *[
             json.dumps({"hs6": "854442", "origin_national_code": None,
                         "destination_national_code": None, "needs_review": True,
                         "classification_reason": "Cable candidate matches", "confidence": "MEDIUM"})
             for _ in range(2)
         ]])
         ocr = Mock()
-        ocr.infer_multi.return_value = ("<PAGE>Invoice item cable", 5)
+        ocr.predict.return_value = [{"rec_texts": ["Invoice item cable"], "rec_boxes": [[0, 0, 200, 20]]}]
         retriever = CatalogRetriever([{"hscode": "854442", "description": "Insulated electric cable"}])
         with patch.dict(os.environ, {"INVOICE_TARIFF_BACKEND": "catalog"}), patch(
-            "AI.main.download_models", return_value={"ocr": {"ocr_model": ocr, "ocr_tokenizer": None}, "qwen": {}}
+            "AI.main.download_models", return_value={"ocr": {"ocr_model": ocr}, "qwen": {}}
         ), patch("AI.main.make_generator", return_value=generate), patch(
             "AI.main.CatalogRetriever.load", return_value=retriever
         ):
@@ -92,12 +92,37 @@ class InvoiceUploadTests(TestCase):
         for invoice in response.json()["invoices"]:
             self.assertEqual(invoice["item_level"][0]["hs6_code"], "854442")
             self.assertTrue(invoice["item_level"][0]["needs_review"])
-        self.assertEqual(generate.call_count, 3)
-        self.assertFalse(Path(ocr.infer_multi.call_args.kwargs["output_path"]).exists())
+        self.assertEqual(generate.call_count, 5)
+        self.assertFalse(Path(ocr.predict.call_args.kwargs["input"]).parent.exists())
 
     def test_missing_file_is_rejected(self):
         response = self.client.post("/api/v1/invoices/extract")
         self.assertEqual(response.status_code, 422)
+
+    def test_native_pdf_preserves_invoice_response_and_never_loads_ocr(self):
+        payload = extracted_result()
+        item = payload["invoices"][0]["item_level"][0]
+        item.update(hs_code="854442", manufacturing_country_hts_code="8544420000",
+                    destination_country_hts_code="8544420010")
+        with pymupdf.open() as document:
+            page = document.new_page()
+            page.insert_text((40, 60), "Invoice INV-001 Electric cable quantity 2 total USD 20.00 receiver Finland")
+            pdf = document.tobytes()
+        generate = Mock(return_value=json.dumps(payload))
+        with patch("AI.main.download_models", return_value={"qwen": {}}) as load, patch(
+            "AI.main.make_generator", return_value=generate
+        ), patch("AI.model.download_ocr") as ocr, patch("AI.utils.pdf_to_images") as render:
+            response = self.client.post('/api/v1/invoices/extract?wait=true', files={"file": ("invoice.pdf", pdf)})
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(result["invoices"][0]["order_level"]["invoice_number"], "INV-001")
+        self.assertEqual(result["invoices"][0]["item_level"][0]["sku_code"], "CABLE-1")
+        self.assertEqual(result["invoices"][0]["item_level"][0]["hs6_code"], "854442")
+        self.assertIn("shipment", result["invoices"][0])
+        load.assert_called_once_with(include_ocr=False)
+        ocr.assert_not_called()
+        render.assert_not_called()
+        generate.assert_called_once()
 
     def test_non_pdf_filename_rejected_before_pipeline(self):
         with patch("AI.main.doc_pipeline") as run:

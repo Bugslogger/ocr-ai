@@ -69,17 +69,17 @@ class InvoiceWebSocketTests(TestCase):
 
     def test_runs_real_pipeline_with_fake_models(self):
         payload = extracted_result()
-        generate = Mock(side_effect=[json.dumps(payload), json.dumps({
+        generate = Mock(side_effect=[json.dumps(payload), json.dumps({"product_type": "electric cable", "needs_review": False}), json.dumps({
             "hs6": "854442", "needs_review": True, "confidence": "MEDIUM",
             "classification_reason": "Cable candidate", "origin_national_code": None,
             "destination_national_code": None,
         })])
         ocr = Mock()
-        ocr.infer_multi.return_value = ("<PAGE>Invoice cable", 3)
+        ocr.predict.return_value = [{"rec_texts": ["Invoice cable"], "rec_boxes": [[0, 0, 200, 20]]}]
         retriever = CatalogRetriever([{"hscode": "854442", "description": "Insulated electric cable"}])
         data = pdf_bytes()
         with patch.dict(os.environ, {"INVOICE_TARIFF_BACKEND": "catalog"}), patch(
-            "AI.main.download_models", return_value={"ocr": {"ocr_model": ocr, "ocr_tokenizer": None}, "qwen": {}}
+            "AI.main.download_models", return_value={"ocr": {"ocr_model": ocr}, "qwen": {}}
         ), patch("AI.main.make_generator", return_value=generate), patch(
             "AI.main.CatalogRetriever.load", return_value=retriever
         ):
@@ -93,7 +93,7 @@ class InvoiceWebSocketTests(TestCase):
                 stages = [e["stage"] for e in events if e["event"] == "progress"]
                 self.assertIn("running_ocr", stages)
                 self.assertIn("classifying_items", stages)
-        self.assertFalse(Path(ocr.infer_multi.call_args.kwargs["output_path"]).exists())
+        self.assertFalse(Path(ocr.predict.call_args.kwargs["input"]).parent.exists())
 
     def test_invalid_metadata(self):
         for value in ["not json", "[]", '{}', '{"filename":"invoice.pdf","size":0}',

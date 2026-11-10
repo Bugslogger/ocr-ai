@@ -10,6 +10,8 @@ from pathlib import Path
 from .main import PIPELINE_LOCK
 from .model import download_qwen
 from .utils import make_generator, parse_json_maybe, save_json
+from .performance import timed_pipeline, timed_lock
+from .model_config import PRODUCT_GENERATION_CONFIG
 
 
 DETAIL_FIELDS = (
@@ -46,6 +48,7 @@ Return JSON only matching this schema:
 """ + json.dumps(PROFILE_SCHEMA)
 
 
+@timed_pipeline("identifying_product")
 def _identify(item, generate):
     descriptions = {key: item.get(key) for key in ("product_description", "simplified_description")}
     fallback = next((text.strip() for text in descriptions.values() if text and text.strip()), None)
@@ -61,7 +64,7 @@ def _identify(item, generate):
             response = parse_json_maybe(generate([
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": json.dumps(descriptions, ensure_ascii=False)},
-            ], max_new_tokens=1000, temperature=0.0))
+            ], **PRODUCT_GENERATION_CONFIG))
             Draft202012Validator(PROFILE_SCHEMA).validate(response)
             profile.update(response)
             profile["search_terms"] = list(dict.fromkeys(
@@ -77,6 +80,7 @@ def _identify(item, generate):
             "error": error}
 
 
+@timed_pipeline("identifying_products")
 def identify_products(invoice_data, output_path=None, *, generate=None, progress=None):
     """Return positional product profiles without modifying the input invoice.
 
@@ -99,7 +103,7 @@ def identify_products(invoice_data, output_path=None, *, generate=None, progress
     Draft202012Validator(input_schema).validate(invoice_data)
     report = progress or (lambda stage: None)
     products = []
-    with PIPELINE_LOCK:
+    with timed_lock(PIPELINE_LOCK, "product_pipeline_lock_wait"):
         for invoice_index, invoice in enumerate(invoice_data["invoices"]):
             for item_index, item in enumerate(invoice["item_level"]):
                 if generate is None and any((item.get(key) or "").strip() for key in

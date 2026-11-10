@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event
-from types import SimpleNamespace
 from unittest import TestCase, main
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
@@ -283,25 +282,20 @@ class InvoiceJobTests(TestCase):
 
         started, release = Event(), Event()
         model = Mock()
-        model.config = SimpleNamespace(sliding_window=128)
 
         def infer(*args, **kwargs):
-            self.assertEqual(model.config.sliding_window, 128)
-            self.assertFalse(hasattr(model.config, "_ring_window"))
-            model.config.sliding_window = None
-            model.config._ring_window = 128
-            if model.infer_multi.call_count == 1:
+            if model.predict.call_count == 1:
                 started.set()
                 if not release.wait(5):
                     raise RuntimeError("Test did not release first invoice")
                 raise RuntimeError("Injected OCR generation failure")
-            return "Second invoice text", 3
+            return [{"rec_texts": ["Second invoice text"], "rec_boxes": [[0, 0, 200, 20]]}]
 
-        model.infer_multi.side_effect = infer
+        model.predict.side_effect = infer
 
         def pipeline(pdf, output, **options):
             options["progress"]("running_ocr")
-            extract_doc(pdf, output, {"ocr_model": model, "ocr_tokenizer": None})
+            extract_doc(pdf, output, {"ocr_model": model})
             return extracted_result()
 
         with patch("AI.main.doc_pipeline", side_effect=pipeline), self.assertLogs(
@@ -318,9 +312,7 @@ class InvoiceJobTests(TestCase):
             final = self.terminal(second)
             self.assertEqual(final.status, JobStatus.SUCCEEDED)
             self.assertEqual(final.result.model_dump(), extracted_result())
-        self.assertEqual(model.infer_multi.call_count, 2)
-        self.assertEqual(model.config.sliding_window, 128)
-        self.assertFalse(hasattr(model.config, "_ring_window"))
+        self.assertEqual(model.predict.call_count, 2)
 
     def test_job_socket_streams_progress_and_persisted_result_on_reconnect(self):
         started, release = Event(), Event()

@@ -12,6 +12,7 @@ import shutil
 
 from server.schemas import InvoiceExtractionResponse, InvoiceJobResponse, JobStatus
 from server.services.invoices import InvoiceProcessor
+from AI.performance import performance_run, timed_stage, record_timing
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +20,15 @@ STAGES = {
     "queued": (0, "Waiting in the invoice queue"),
     "starting": (1, "Worker started; waiting for the shared pipeline if busy"),
     "loading_tariff_index": (70, "Loading tariff reference data for codes missing from the invoice"),
-    "loading_models": (10, "Loading or reusing OCR and Qwen models"),
+    "loading_models": (10, "Loading or reusing Qwen"),
+    "extracting_pdf_text": (15, "Extracting embedded PDF text; checking pages for OCR fallback"),
+    "loading_ocr_model": (18, "Loading or reusing PaddleOCR for pages without usable PDF text"),
     "running_ocr": (20, "Reading invoice pages with OCR"),
     "cleaning_text": (45, "Cleaning the extracted OCR text"),
     "extracting_json": (55, "Extracting structured invoice JSON"),
+    "identifying_products": (60, "Identifying products for tariff retrieval"),
+    "identifying_product": (60, "Identifying an invoice product"),
+    "loading_product_model": (60, "Loading or reusing the product identification model"),
     "retrieving_tariffs": (75, "Retrieving tariff candidates for invoice items"),
     "classifying_items": (85, "Classifying items and validating tariff codes"),
     "completed": (99, "Validating and saving the final result"),
@@ -103,7 +109,8 @@ class InvoiceJobService:
         folder = self.root / job_id
         folder.mkdir(parents=True)
         try:
-            self.processor.save_upload(stream, filename, folder / "invoice.pdf")
+            with performance_run("invoice_job_upload", run_id=job_id):
+                self.processor.save_upload(stream, filename, folder / "invoice.pdf")
             now = datetime.now(timezone.utc)
             job = InvoiceJobResponse(job_id=job_id, status=JobStatus.QUEUED, stage="queued",
                                      stage_description=STAGES["queued"][1],
@@ -202,21 +209,29 @@ class InvoiceJobService:
                 self._queue.task_done()
 
     def _run(self, job_id):
-        pdf = self.root / job_id / "invoice.pdf"
-        result = None
-        error = None
-        try:
-            filename = self._read(job_id)["filename"]
-            with pdf.open("rb") as stream:
-                value = self.processor.process(stream, filename, progress=lambda stage: self._update(job_id, stage=stage))
-            result = InvoiceExtractionResponse.model_validate(value).model_dump(mode="json")
-        except Exception:
-            logger.exception("Background invoice AI pipeline failed for job %s", job_id)
-            error = "Invoice extraction failed. Check server logs for details."
-        finally:
-            pdf.unlink(missing_ok=True)
-        self._update(job_id, status=JobStatus.FAILED.value if error else JobStatus.SUCCEEDED.value,
-                     stage="failed" if error else "completed", result=result, error=error)
+        with performance_run("invoice_job", run_id=job_id) as metrics:
+            pdf = self.root / job_id / "invoice.pdf"
+            result = None
+            error = None
+            try:
+                data = self._read(job_id)
+                filename = data["filename"]
+                queued_ms = (datetime.now(timezone.utc) - datetime.fromisoformat(data["created_at"])).total_seconds() * 1000
+                record_timing("queue_wait", queued_ms)
+                with pdf.open("rb") as stream:
+                    value = self.processor.process(stream, filename, progress=lambda stage: self._update(job_id, stage=stage))
+                with timed_stage("validating_api_result"):
+                    result = InvoiceExtractionResponse.model_validate(value).model_dump(mode="json")
+            except Exception:
+                logger.exception("Background invoice AI pipeline failed for job %s", job_id)
+                error = "Invoice extraction failed. Check server logs for details."
+            finally:
+                with timed_stage("cleaning_job_upload"):
+                    pdf.unlink(missing_ok=True)
+            metrics["stage_status"] = "failed" if error else "ok"
+            with timed_stage("saving_job_result"):
+                self._update(job_id, status=JobStatus.FAILED.value if error else JobStatus.SUCCEEDED.value,
+                             stage="failed" if error else "completed", result=result, error=error)
 
 
 invoice_jobs = InvoiceJobService()

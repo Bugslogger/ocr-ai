@@ -126,14 +126,18 @@ class GPUMonitor:
             capabilities = {gpu["bf16_supported"] for gpu in devices} if telemetry["available"] else set()
             bf16 = next(iter(capabilities)) if len(capabilities) == 1 else None
             cuda = runtime["cuda_available"]
-            ready = False if cuda is False or bf16 is False else (True if cuda is True and bf16 is True else None)
+            # PaddleOCR may use CPU or its own CUDA runtime. PyTorch telemetry
+            # cannot prove Paddle GPU readiness; BF16 is no longer required.
+            from AI.model_config import Oconfig
+            ready = None if Oconfig["device"].startswith("gpu") else False
             from AI import model
             configuration = {
                 **runtime, "cuda_driver_version": telemetry["driver_cuda"],
                 "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
                 "cuda_device_order": os.getenv("CUDA_DEVICE_ORDER"),
-                "bf16_hardware_supported": bf16, "ocr_gpu_ready": ready,
-                "loaded_models": {kind: kind in model._models for kind in model.MODEL_DEFAULTS},
+                "bf16_hardware_supported": bf16,
+                "ocr_device": Oconfig["device"], "ocr_gpu_ready": ready,
+                "loaded_models": {kind: kind in model._models for kind in ("ocr", "qwen")},
                 "checks": [
                     {"name": "cuda", "passed": cuda, "detail": "PyTorch can access a CUDA device"},
                     {"name": "bf16_hardware", "passed": bf16,

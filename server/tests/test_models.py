@@ -23,17 +23,22 @@ class ModelDownloadTests(TestCase):
     def test_downloads_configured_repositories_and_returns_paths_without_loading(self):
         with TemporaryDirectory() as directory:
             hub = Path(directory) / "hub"
-            snapshots = [hub / "models--test--ocr" / "snapshots" / "ocr-commit",
+            snapshots = [hub / "models--test--det" / "snapshots" / "det-commit",
+                         hub / "models--test--rec" / "snapshots" / "rec-commit",
                          hub / "models--test--qwen" / "snapshots" / "qwen-commit"]
             def snapshot(**options):
-                path = snapshots[0 if options["repo_id"] == "test/ocr" else 1]
+                path = snapshots[{"test/det": 0, "test/rec": 1, "test/qwen": 2}[options["repo_id"]]]
                 path.mkdir(parents=True)
-                (path / "config.json").write_text("{}")
-                (path / "model.safetensors").touch()
+                if options["repo_id"] == "test/qwen":
+                    (path / "config.json").write_text("{}")
+                    (path / "model.safetensors").touch()
+                else:
+                    for filename in ("inference.json", "inference.yml", "inference.pdiparams"):
+                        (path / filename).touch()
                 return str(path)
 
-            environment = {"HF_HUB_CACHE": str(hub), "OCR_MODEL_ID": "test/ocr",
-                           "QWEN_MODEL_ID": "test/qwen", "OCR_MODEL_REVISION": "ocr-tag",
+            environment = {"HF_HUB_CACHE": str(hub), "OCR_DET_MODEL_ID": "test/det", "OCR_REC_MODEL_ID": "test/rec",
+                           "QWEN_MODEL_ID": "test/qwen", "OCR_DET_MODEL_REVISION": "det-tag", "OCR_REC_MODEL_REVISION": "rec-tag",
                            "QWEN_MODEL_REVISION": "qwen-tag"}
             sentinel = {"existing": object()}
             with patch.dict(os.environ, environment), patch.dict(model._models, sentinel, clear=True), patch(
@@ -42,11 +47,13 @@ class ModelDownloadTests(TestCase):
                 response = self.client.post("/api/v1/models/download")
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json(), {"models": [
-                    {"model_id": "test/ocr", "revision": "ocr-commit", "location": str(snapshots[0])},
-                    {"model_id": "test/qwen", "revision": "qwen-commit", "location": str(snapshots[1])},
+                    {"model_id": "test/det", "revision": "det-commit", "location": str(snapshots[0])},
+                    {"model_id": "test/rec", "revision": "rec-commit", "location": str(snapshots[1])},
+                    {"model_id": "test/qwen", "revision": "qwen-commit", "location": str(snapshots[2])},
                 ]})
                 self.assertEqual(download.call_args_list, [
-                    call(repo_id="test/ocr", revision="ocr-tag", cache_dir=str(hub)),
+                    call(repo_id="test/det", revision="det-tag", cache_dir=str(hub)),
+                    call(repo_id="test/rec", revision="rec-tag", cache_dir=str(hub)),
                     call(repo_id="test/qwen", revision="qwen-tag", cache_dir=str(hub)),
                 ])
                 load_ocr.assert_not_called()
@@ -54,7 +61,7 @@ class ModelDownloadTests(TestCase):
                 self.assertEqual(model._models, sentinel)
                 status = self.client.get("/api/v1/models/status").json()
                 self.assertTrue(status["all_downloaded"])
-                self.assertEqual([m["model_id"] for m in status["models"]], ["test/ocr", "test/qwen"])
+                self.assertEqual([m["model_id"] for m in status["models"]], ["test/det", "test/rec", "test/qwen"])
 
     def test_download_errors_return_502_without_private_details(self):
         with patch("huggingface_hub.snapshot_download", side_effect=OSError("private token detail")), self.assertLogs(
@@ -71,9 +78,11 @@ from unittest.mock import patch
 from AI.model import download_model_files
 with patch("huggingface_hub.snapshot_download", return_value="/tmp/cache/snapshots/commit"):
     results = download_model_files()
-assert len(results) == 2
+assert len(results) == 3
 assert "torch" not in sys.modules
 assert "transformers" not in sys.modules
+assert "paddleocr" not in sys.modules
+assert "paddle" not in sys.modules
 '''
         subprocess.run([sys.executable, "-c", script], check=True)
 
@@ -100,6 +109,16 @@ assert "transformers" not in sys.modules
             self.assertFalse(_is_downloaded(path))
             index.write_text('{"weight_map":[]}')
             self.assertFalse(_is_downloaded(path))
+
+    def test_paddle_status_requires_both_inference_configurations_and_weights(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "inference.pdiparams").touch()
+            self.assertFalse(_is_downloaded(path))
+            (path / "inference.json").write_text("{}")
+            self.assertFalse(_is_downloaded(path))
+            (path / "inference.yml").write_text("{}")
+            self.assertTrue(_is_downloaded(path))
 
 
 if __name__ == "__main__":

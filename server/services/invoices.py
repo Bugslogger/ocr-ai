@@ -3,6 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, BinaryIO, Callable
 import os
+from AI.performance import timed_pipeline
 
 
 class InvalidInvoiceError(ValueError):
@@ -30,6 +31,7 @@ class InvoiceProcessor:
             raise RuntimeError("INVOICE_MAX_UPLOAD_BYTES must be positive")
         return max_bytes
 
+    @timed_pipeline("validating_upload")
     def save_upload(self, stream: BinaryIO, filename: str | None, destination: Path) -> None:
         """Stage and validate a PDF before either synchronous or queued processing."""
         self.validate_filename(filename)
@@ -45,6 +47,7 @@ class InvoiceProcessor:
             raise InvalidInvoiceError("The uploaded PDF is empty")
         self._validate_pdf(destination)
 
+    @timed_pipeline("invoice_request")
     def process(self, stream: BinaryIO, filename: str | None,
                 progress: Callable[[str], None] | None = None) -> dict[str, Any]:
         self.validate_filename(filename)

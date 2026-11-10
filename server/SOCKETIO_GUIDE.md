@@ -18,7 +18,7 @@ For a frontend running on a different origin, set the allowed frontend origins *
 export SOCKETIO_ALLOWED_ORIGINS='http://localhost:3000,http://localhost:5173,https://your-frontend.example'
 ```
 
-The default is same-origin checking. Origins include scheme and port, without a path or trailing slash. This setting configures the Socket.IO transport; it does not add CORS middleware for browser REST calls. Use one server process per GPU with the existing process-local queue and model cache.
+The default allowed origin is `https://dev.admin.logistx.us`. An explicitly empty `SOCKETIO_ALLOWED_ORIGINS` restores same-origin checking. Origins include scheme and port, without a path or trailing slash. This setting controls Socket.IO only; REST CORS is configured separately in `server/app.py` and currently permits `https://dev.admin.logistx.us`. Use one server process per GPU with the existing process-local queue and model cache.
 
 Install the browser client in your frontend project:
 
@@ -237,3 +237,18 @@ Disconnecting unsubscribes monitoring tasks without canceling extraction. Reconn
 - User authentication and job ownership are not implemented. Knowing a job ID permits lookup/subscription, as with the REST endpoint.
 
 Implementation: [Socket.IO event handlers](api/socketio.py), [application mount](app.py), and [protocol integration tests](tests/test_socketio.py). Protocol integration follows the [official python-socketio ASGI and event documentation](https://python-socketio.readthedocs.io/en/stable/server.html).
+
+## Model configuration and stage timings
+
+All invoice transports use the same configuration in
+[`AI/model_config.py`](../AI/model_config.py): native PDF text first, PaddleOCR
+mobile detection/English recognition on fallback pages, and 4-bit Qwen3-8B.
+Native-only PDFs skip OCR loading and recognition stages. Clients should display
+`stage_description` and tolerate additional stage names rather than assuming
+that every job runs OCR. The job/result event envelopes and invoice JSON fields
+remain unchanged.
+
+See the [model configuration reference](../AI/README.md#model-configuration) for
+settings and restart requirements. Stage performance records are written to the
+server log, correlated by job ID; they are not extra Socket.IO events or invoice
+response fields.

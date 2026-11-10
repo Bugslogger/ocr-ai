@@ -31,8 +31,15 @@ class GPUMonitorTests(TestCase):
         self.assertTrue(result.available)
         self.assertFalse(result.in_use)
         self.assertFalse(result.active)
-        self.assertTrue(result.configuration.ocr_gpu_ready)
+        self.assertIsNone(result.configuration.ocr_gpu_ready)
         self.assertTrue(result.configuration.bf16_hardware_supported)
+
+    def test_pytorch_telemetry_does_not_claim_paddle_gpu_readiness(self):
+        from AI.config import Oconfig
+        with patch.dict(Oconfig, {"device": "gpu:0"}):
+            result = self.sample()
+        self.assertEqual(result.configuration.ocr_device, "gpu:0")
+        self.assertIsNone(result.configuration.ocr_gpu_ready)
 
     def test_gpu_can_be_in_use_while_not_computing(self):
         telemetry = deepcopy(TELEMETRY)
@@ -48,7 +55,7 @@ class GPUMonitorTests(TestCase):
                                       "cuda_runtime_version": None},
                              telemetry={"available": False, "driver_cuda": None, "gpus": [], "errors": ["No driver"]})
         self.assertFalse(result.available)
-        self.assertFalse(result.configuration.ocr_gpu_ready)
+        self.assertIsNone(result.configuration.ocr_gpu_ready)
         self.assertIsNone(result.in_use)
         self.assertEqual(result.gpus, [])
         self.assertEqual(result.errors, ["No driver"])
@@ -140,7 +147,7 @@ class GPUEndpointTests(TestCase):
             response = self.client.get("/api/v1/gpu/status")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["gpus"][0]["name"], "NVIDIA A100")
-        self.assertTrue(response.json()["configuration"]["ocr_gpu_ready"])
+        self.assertIsNone(response.json()["configuration"]["ocr_gpu_ready"])
         self.assertEqual(response.headers["cache-control"], "no-store")
 
     def test_websocket_stream_sends_repeated_status_events(self):

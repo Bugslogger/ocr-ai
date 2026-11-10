@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 import sys
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 # Support both `uvicorn server.app:app` from /workspace and `uvicorn app:app`
 # from /workspace/server. Uvicorn's reload subprocess otherwise cannot resolve
@@ -23,6 +24,16 @@ from server.api.socketio import InvoiceSocketIO
 import socketio
 
 
+class RESTCORSMiddleware(CORSMiddleware):
+    async def __call__(self, scope, receive, send):
+        # Socket.IO provides its own CORS handling, including polling requests.
+        path = scope.get("path", "")
+        if path == "/socket.io" or path.startswith("/socket.io/"):
+            await self.app(scope, receive, send)
+        else:
+            await super().__call__(scope, receive, send)
+
+
 def create_app() -> FastAPI:
     transport = InvoiceSocketIO()
 
@@ -34,6 +45,13 @@ def create_app() -> FastAPI:
             await transport.close()
 
     app = FastAPI(title="Invoice OCR API", version="1.0.0", lifespan=lifespan)
+    app.add_middleware(
+        RESTCORSMiddleware,
+        allow_origins=["https://dev.admin.logistx.us"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.state.socketio = transport
     app.include_router(rest_router, prefix="/api/v1")
     app.include_router(models_router, prefix="/api/v1")

@@ -6,6 +6,7 @@ import io
 import json
 import math
 import re
+from .model_config import TARIFF_GENERATION_CONFIG
 from urllib.request import urlopen
 
 HS_CSV_URL = "https://raw.githubusercontent.com/datasets/harmonized-system/main/data/harmonized-system.csv"
@@ -358,7 +359,7 @@ def classify_item(item, order, matches, generate):
                     "classification_reason, confidence (HIGH, MEDIUM, LOW), and needs_review (boolean)."
                 )},
                 {"role": "user", "content": json.dumps(prompt)},
-            ], max_new_tokens=700, temperature=0.0))
+            ], **TARIFF_GENERATION_CONFIG))
             if not isinstance(selection.get("needs_review"), bool):
                 raise ValueError("Classification response must include boolean needs_review")
             if selection.get("confidence") not in {"HIGH", "MEDIUM", "LOW"}:

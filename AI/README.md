@@ -8,12 +8,16 @@ The `AI` package converts a PDF into structured invoice JSON, retrieves tariff c
 
 ```mermaid
 flowchart TD
-    A[Input PDF] --> B[Render page images in a temporary directory]
-    B --> C[Unlimited OCR returns text]
-    C --> D[Save raw OCR and clean markup]
+    A[Input PDF] --> T[Extract and check native text per page]
+    T --> U{Usable text with no large images}
+    U -->|Yes| D[Combine ordered page text and clean markup]
+    U -->|No| B[Render only pages needing OCR]
+    B --> C[PP-OCRv5 mobile detection and English recognition]
+    C --> D
     D --> E[Qwen extracts all invoices and items]
     E --> F[Validate JSON against the invoice schema]
-    F --> G{Retrieval backend}
+    F --> P[Identify products with Qwen when tariff lookup is needed]
+    P --> G{Retrieval backend}
     G --> H[International HS catalog and national overlays]
     G --> I[Country filtered Weaviate keyword search]
     H --> J[Candidates keyed by invoice and item position]
@@ -24,7 +28,7 @@ flowchart TD
     M --> N[Save final classification JSON]
 ```
 
-1. **Render and OCR.** PyMuPDF renders every page at the configured DPI. `infer_multi()` processes the page images using the original Document parsing prompt and returns text directly. Empty/markup-only output or recognizable Ground Truth evaluation commentary triggers a retry of each page with the cropped single-image `infer()` API and the same parsing prompt. Every retry page must produce usable text; otherwise the run fails with the page number instead of returning a partial invoice. Each inference call restores the model's temporary sliding-window settings in `finally`, including on failure, so retries and subsequent queued invoices start with the original settings. Retry diagnostics log page count, text length, and output token count without invoice text. Temporary images are removed on success and failure. The raw text is written to `detailed_invoice_output.txt`.
+1. **Extract text first, then OCR.** PyMuPDF reads native PDF words and groups them by bounding boxes. A page uses native text when it has at least 40 non-whitespace characters, four words, sufficient alphanumeric content, no replacement/control characters, no extraction warnings, and less than 10% image area. Otherwise the whole page falls back to OCR so a native header cannot hide a scanned invoice body. This is a conservative heuristic; it cannot prove the text layer matches the visible invoice. Only fallback pages are rendered at `OCR_DPI` (default 250), and Paddle models are loaded only if a page needs OCR. PaddleOCR uses exactly `PP-OCRv5_mobile_det` for detection and `en_PP-OCRv5_mobile_rec` for English recognition. Document orientation, unwarping, and text-line orientation models are disabled. Bounding boxes are grouped into rows, with cells ordered left to right and separated by tabs. Pages retain PDF order with `<PAGE>` separators in `detailed_invoice_output.txt`. Empty pages and malformed results fail explicitly to avoid returning partial invoices. Temporary page images are removed on success and failure. This is geometric text ordering, not table structure recognition; rotated text and complex merged tables need accuracy checks.
 2. **Clean.** Detection coordinates and markup are removed, preserving table cell boundaries and page breaks. The result is written to `plain_invoice_text.txt`. Empty OCR output stops the run.
 3. **Extract.** Qwen receives the text and the shared JSON Schema. It extracts invoice, shipment, and line-item fields without inferring tariff codes. Missing values are null. Manufacturing country must come from product evidence; it is not copied from the sender's address.
 4. **Validate extraction.** Missing invoice data fields are filled with null before validation, including fields in omitted order and shipment objects. Malformed JSON, unexpected fields, incorrect supplied field types, empty invoice lists, and empty item lists stop the run. Valid extraction is saved before classification modifies it.
@@ -38,22 +42,24 @@ flowchart TD
 | --- | --- |
 | `main.py` | Full pipeline, progress events, CLI, and connection cleanup |
 | `model.py` | Lazy model loading and process-local model reuse |
+| `ocr.py` | PaddleOCR bounding-box validation and text row/column ordering |
 | `utils.py` | PDF rendering, OCR, text cleaning, Qwen generation, extraction, and output writing |
 | `schema.py` | Shared extraction contract and JSON Schema validation |
 | `prompt.py` | Extraction instructions generated around that contract |
 | `tariff.py` | Country resolution, retrieval backends, candidate validation, and classification |
 | `db_connect.py` | Weaviate connection without API-key authentication |
-| `config.py` | Inference defaults and environment-based database settings |
+| `model_config.py` | All model names, revisions, OCR settings, quantization, devices, precision, and generation budgets |
+| `config.py` | Environment-based database settings and compatibility imports for model settings |
 | `OCR_HTS_DB.ipynb`, `OCR_HTS.ipynb` | Notebook entry points calling `doc_pipeline()` |
 | `tests/test_pipeline.py` | Regression tests with small PDFs and fake model/database responses |
 
-Imports do not download models or contact databases. Models load on the first processing call and remain cached in that process. Full pipeline calls are serialized; OCR inference also has a shared lock because the model temporarily changes its configuration.
+Imports do not download models or contact databases. Qwen loads on the first full processing call; PaddleOCR loads only on the first page requiring OCR. Loaded models remain cached in that process. Full pipeline calls are serialized; OCR predictor calls share a lock for thread safety.
 
-OCR generation explicitly supplies an all-ones attention mask for the model's single unpadded input and a padding token ID. The repository's default `max_new_tokens` is cleared for these calls so `Oconfig.max_length` controls the total input/output sequence limit. The temporary generation wrapper and sliding-window settings are restored even after an exception. PDF validation and rendering share a separate lock; a MuPDF compressed-stream warning triggers one fresh-open render attempt. Persistent decompression errors fail before the rendered images reach OCR, rather than accepting a partial page.
+PDF validation and rendering share a separate lock; a MuPDF compressed-stream warning triggers one fresh-open render attempt. Persistent decompression errors fail before the rendered images reach OCR.
 
 ## Installation
 
-Use Python 3.10 or later and a CUDA GPU with BF16 support for Unlimited-OCR. The OCR model implementation moves tensors to CUDA and uses BF16 autocast internally. Qwen can load on CPU, but that does not make the full OCR pipeline CPU-compatible.
+Use Python 3.11 or later for the API. PaddleOCR and Qwen both run on GPU by default. Install `paddlepaddle-gpu` for OCR and a CUDA-enabled PyTorch build for Qwen. The A40 host uses Paddle CUDA 11.8 wheels; other hosts must use wheels compatible with their NVIDIA driver. PDF parsing, rendering, and file handling remain CPU operations.
 
 Create an environment from the repository root:
 
@@ -61,19 +67,153 @@ Create an environment from the repository root:
 python -m venv .venv
 ```
 
-Activate it using `source .venv/bin/activate` on Linux, or `.venv\Scripts\Activate.ps1` in Windows PowerShell. Install a matching CUDA build of PyTorch and torchvision for the GPU host, then install the package requirements:
+Activate it using `source .venv/bin/activate` on Linux, or `.venv\Scripts\Activate.ps1` in Windows PowerShell. Install a matching CUDA build of PyTorch for the GPU host, then install the package requirements:
 
 ```bash
 python -m pip install -r AI/requirements.txt
 ```
 
-For the API server, also install `server/requirements.txt`. Keep the full pipeline in one worker process per GPU unless you have provisioned memory for multiple copies of both models.
+For the API server, also install `server/requirements.txt`. Keep the full pipeline in one worker process per GPU unless you have provisioned memory for multiple copies of the OCR pipeline and Qwen.
 
-The requirements pin PyTorch 2.10.0 and torchvision 0.25.0 together. On the A100 host, install their CUDA 12.8 builds before the requirements with `python -m pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128`. Use the same interpreter for package installation and server startup; see the exact `/workspace/server/venv/bin/python` commands in [`server/README.md`](../server/README.md).
+The AI requirements require PyTorch 2.10 or later and pin Transformers 4.57.1. The server requirements contain only API dependencies so both files can be installed in one environment without conflicting model-library pins. On a CUDA 12.8 host, install PyTorch first with `python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128`. Torchvision and torchaudio are not required by this text-only Qwen/PaddleOCR flow. Use the same interpreter for installation and server startup.
 
-Model defaults are `baidu/Unlimited-OCR` and `Qwen/Qwen2.5-7B-Instruct`. Hugging Face uses its normal cache and `HF_TOKEN` environment variable. Set `OCR_MODEL_REVISION` and `QWEN_MODEL_REVISION` to commit hashes when reproducible model code and weights are required. Unlimited-OCR loads custom model code with `trust_remote_code=True`.
+Model repositories are `PaddlePaddle/PP-OCRv5_mobile_det`, `PaddlePaddle/en_PP-OCRv5_mobile_rec`, and `Qwen/Qwen3-8B`. Qwen supports optional NF4 4-bit double quantization (`load_in_4bit` is currently `False` in `QWEN_QUANTIZATION_CONFIG`), BF16 compute by default (`QWEN_COMPUTE_DTYPE=auto` enables BF16/FP16 capability selection), SDPA attention, and one selected GPU without automatic CPU/disk offload. Thinking is disabled via the chat template for structured JSON generation. All use the shared Hugging Face cache and support `HF_TOKEN`. Override repositories with `OCR_DET_MODEL_ID`, `OCR_REC_MODEL_ID`, and `QWEN_MODEL_ID`; pin revisions with the corresponding `*_MODEL_REVISION` variables. The OCR loader supplies the downloaded local model directories to PaddleOCR.
 
-The adapter uses the text returned by [`infer_multi()`](https://huggingface.co/baidu/Unlimited-OCR/blob/main/modeling_unlimitedocr.py). It passes `save_results=False` to avoid the model's markdown postprocessor discarding text without page markers. The expected return is a string or a tuple whose first element is text; unsupported returns fail explicitly.
+OCR settings: `OCR_DEVICE=gpu:0` (default), `OCR_DPI=250`, and `OCR_RECOGNITION_BATCH_SIZE=32`. Install the GPU framework in the same environment as the API. Do not install both Paddle engine packages together:
+
+```bash
+python -m pip uninstall -y paddlepaddle paddlepaddle-gpu
+python -m pip install paddlepaddle-gpu==3.2.2 --index-url https://www.paddlepaddle.org.cn/packages/stable/cu118/
+python -m pip install -r AI/requirements.txt -r server/requirements.txt
+```
+
+Paddle's CUDA 11.8 and PyTorch's CUDA packages can both install `libnccl.so.2`
+at the same location. After installing Paddle, restore the NCCL package required
+by the installed CUDA PyTorch build so later Torch imports keep working:
+
+```bash
+python - <<'PY'
+from importlib.metadata import requires
+import subprocess
+import sys
+
+pins = [requirement for requirement in requires("torch") or []
+        if requirement.split(";", 1)[0].strip().startswith("nvidia-nccl-")]
+if pins:
+    subprocess.run([sys.executable, "-m", "pip", "install",
+                    "--force-reinstall", "--no-deps", *pins], check=True)
+PY
+```
+
+If the official index is unavailable, the official CUDA 11.8 wheel for this Linux x86-64 / Python 3.12 host can be installed directly:
+
+```bash
+python -m pip install https://paddle-whl.bj.bcebos.com/stable/cu118/paddlepaddle-gpu/paddlepaddle_gpu-3.2.2-cp312-cp312-linux_x86_64.whl
+```
+
+Run the NCCL restoration step after a direct wheel installation too. Validate
+both frameworks together before starting the API:
+
+```bash
+FLAGS_allocator_strategy=auto_growth python - <<'PY'
+import torch
+assert torch.cuda.is_available()
+assert torch.tensor([1.0], device="cuda:0").sum().item() == 1.0
+import paddle
+assert paddle.device.is_compiled_with_cuda()
+paddle.set_device("gpu:0")
+assert float(paddle.to_tensor([1.0]).sum()) == 1.0
+print("PyTorch and Paddle GPU operations passed")
+PY
+```
+
+Paddle uses `gpu:0` device syntax, while PyTorch/Qwen uses `cuda:0`. `PADDLE_ENV_CONFIG` sets `FLAGS_allocator_strategy=auto_growth` before Paddle imports to allocate GPU memory as needed. Explicit environment values take precedence. Restart the API after changing settings or framework packages. See the [official Paddle installation guide](https://www.paddlepaddle.org.cn/en/install/quick) for other CUDA/Python combinations.
+
+## Model configuration
+
+Edit all model names and inference settings in [`model_config.py`](model_config.py).
+It contains configuration values only; model loading stays in `model.py` and
+Weaviate connection settings stay in `config.py`. Existing `Qconfig`, `Qruntime`,
+and `Oconfig` imports remain compatible through aliases.
+
+| Configuration | Controls |
+| --- | --- |
+| `MODEL_DEFAULTS` | Detection, recognition, and Qwen repository names |
+| `MODEL_REVISIONS` | Optional revision pins for `ocr_det`, `ocr_rec`, and `qwen`; defaults to `None` |
+| `MODEL_CACHE_CONFIG` | Default cache base, vendor directory, and hub directory |
+| `OCR_CONFIG` | Paddle device, rendering DPI, recognition batch size, and native PDF text routing |
+| `PADDLE_ENV_CONFIG` | Paddle runtime environment defaults, including GPU memory growth |
+| `OCR_PIPELINE_CONFIG` | Optional orientation and unwarping models; all disabled by default |
+| `QWEN_RUNTIME_CONFIG` | GPU device, compute dtype, and accepted context budget |
+| `QWEN_QUANTIZATION_CONFIG` | Optional 4-bit NF4 and double quantization settings; disabled when `load_in_4bit=False` |
+| `QWEN_LOAD_CONFIG` | SDPA attention and low-memory model loading |
+| `QWEN_CHAT_TEMPLATE_CONFIG` | Chat formatting and thinking mode; thinking is disabled |
+| `QWEN_GENERATION_CONFIG` | Invoice extraction output budget: 15,000 tokens, temperature 0.0 |
+| `GENERATION_DEFAULTS` | Direct generator defaults: 8,000 tokens, temperature 0.0 |
+| `PRODUCT_GENERATION_CONFIG` | Product identification budget: 1,000 tokens, temperature 0.0 |
+| `TARIFF_GENERATION_CONFIG` | Per-item classification budget: 700 tokens, temperature 0.0 |
+
+`Qconfig` aliases `QWEN_GENERATION_CONFIG`, `Qruntime` aliases
+`QWEN_RUNTIME_CONFIG`, and `Oconfig` aliases `OCR_CONFIG`. Use the descriptive
+configuration names for new code. `AI/config.py` re-exports the aliases for
+existing callers; it no longer defines separate model settings.
+
+Repository environment overrides take precedence over `MODEL_DEFAULTS`:
+`OCR_DET_MODEL_ID`, `OCR_REC_MODEL_ID`, and `QWEN_MODEL_ID`. Their corresponding
+`*_MODEL_REVISION` variables override `MODEL_REVISIONS`. Cache resolution is
+`HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME/hub`, then the XDG/home defaults.
+
+After editing this file or setting environment variables, restart the API.
+Configuration changes do not replace objects already cached in a running worker.
+`POST /api/v1/models/download` downloads files; it does not switch a loaded model.
+Use `GET /api/v1/models/status` to inspect files and `/api/v1/gpu/status` to see
+which model bundles are loaded in the worker serving that request.
+
+## Performance and memory settings
+
+
+The default configuration places PaddleOCR on `gpu:0` and Qwen3-8B on `cuda:0`, sharing the first visible GPU.
+Models are cached per process and full invoice inference is serialized to avoid
+concurrent KV caches. Native-only PDFs do not render images or load PaddleOCR.
+`download_models(include_ocr=False)` loads only Qwen; the default helper call
+still explicitly loads both OCR and Qwen for callers that want to preload them.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PDF_TEXT_FIRST` | `true` | Set `false` to force OCR on every page |
+| `PDF_TEXT_MIN_CHARS` | `40` | Minimum non-whitespace native characters per page |
+| `OCR_DEVICE` | `gpu:0` | Paddle GPU device; requires the GPU framework wheel |
+| `OCR_DPI` | `250` | Rendering resolution for fallback pages |
+| `OCR_RECOGNITION_BATCH_SIZE` | `32` | Text recognition crop batch size |
+| `QWEN_DEVICE` | `cuda:0` | GPU for all Qwen weights |
+| `QWEN_COMPUTE_DTYPE` | `bfloat16` | `auto`, `bfloat16`, `float16`, or `float32` compute dtype |
+| `QWEN_MAX_CONTEXT_TOKENS` | `32768` | Prompt plus output budget cap, bounded by model context |
+| `QWEN_MAX_NEW_TOKENS` | `15000` | Extraction output ceiling; reaching it fails rather than returning truncated JSON |
+
+The context cap bounds accepted sequence lengths; it is not a hard GPU memory
+quota. Lower it for tighter memory budgets, keeping it larger than the prompt
+plus the output ceiling. Large invoices can require more memory and generation
+work. Do not increase worker count to accelerate one invoice: each worker loads
+another model copy. Model/revision overrides take precedence over defaults;
+remove an old `QWEN_MODEL_ID` override when switching to Qwen3-8B. Restart the API
+to replace models already cached in memory.
+
+Every processing stage emits a `performance` JSON log with `run_id`, `stage`,
+`elapsed_ms`, and `status`. Timings cover uploads, queue wait, model loading,
+pipeline/OCR lock wait, native extraction, fallback rendering, OCR per page,
+cleanup, JSON extraction and validation, product identification, tariff setup
+and retrieval, item classification, file saves, and total pipeline duration.
+Qwen decode logs also include input/output token counts and current GPU allocated
+and reserved MiB. OCR page timing includes detection and recognition together.
+Queued processing uses the job ID as `run_id`; nested stages share that ID.
+Failures log their exception type without adding invoice text. Nested durations
+overlap and must not be added together. Generation timings include device work
+needed to return output tokens; they are wall-clock timings, not CUDA kernel profiles.
+
+Run through `bash scripts/run_server.sh` to save these records in
+`logs/server.log`. Search for `performance` to compare first-request model loading
+with warm requests. No end-to-end latency target is implied by the model change;
+benchmark native, scanned, and mixed invoices against their original values.
 
 ## Run from the command line
 
@@ -213,7 +353,7 @@ The FastAPI service exposes `POST /api/v1/invoices/extract`: upload an invoice P
 
 The WebSocket endpoint `/ws/invoices/extract` accepts JSON filename/size metadata followed by binary PDF chunks. It runs the same processor and sends progress events followed by a `completed` event whose `result` contains the invoice JSON. See the server guide for the message protocol and client example.
 
-Call `POST /api/v1/models/download` without a body to download and store both model repositories before processing invoices. It returns cache snapshot paths and revisions without importing Torch or loading model objects. The inference loaders use the same cache directory. `GET /api/v1/models/status` checks cached weights, including all shards in a weight index.
+Call `POST /api/v1/models/download` without a body to download and store all three model repositories before processing invoices. It returns cache snapshot paths and revisions without importing Torch or loading model objects. The inference loaders use the same cache directory. `GET /api/v1/models/status` checks cached weights, including all shards in a weight index.
 
 The existing path-based `/api/v1/jobs` endpoints remain OCR-only. Their processor imports `AI.model` and `AI.utils`, loads only OCR, and returns raw and cleaned text paths. Their REST/WebSocket contract is unchanged. See [`server/README.md`](../server/README.md) for upload examples, API flow, configuration, error codes, and startup commands.
 

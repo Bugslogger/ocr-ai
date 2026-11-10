@@ -40,3 +40,14 @@ is intended for a single writer. Child output is recorded as INFO text, preservi
 any original severity labels. Python child output is unbuffered; other programs
 may require their own unbuffered-output option. Logs can contain anything the
 command prints, including document content. Existing logs are appended on restart.
+
+The AI pipeline writes `performance` JSON records into the same log stream,
+including stage durations, a correlation `run_id` (the job ID for queued work),
+per-page native/OCR routing, Qwen token counts, and GPU allocated/reserved memory.
+See [AI performance settings](../AI/README.md#performance-and-memory-settings).
+
+Model names and settings are centralized in
+[`AI/model_config.py`](../AI/model_config.py). Set supported environment overrides
+before running the startup script. Restart the server after changing settings;
+the runner does not reload configuration or replace cached models. See the
+[model configuration reference](../AI/README.md#model-configuration).

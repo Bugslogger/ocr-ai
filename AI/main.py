@@ -9,14 +9,19 @@ from .model import download_ocr, download_qwen
 from .tariff import CatalogRetriever, WeaviateRetriever, needs_tariff_lookup
 from .utils import (extract_doc, clean_extracted_text, format_json, make_generator,
                     fetch_hts, update_invoice, save_json)
+from .performance import timed_pipeline, timed_stage, timed_lock
 
 PIPELINE_LOCK = RLock()
 
 
-def download_models():
-    return {"ocr": download_ocr(), "qwen": download_qwen()}
+def download_models(*, include_ocr=True):
+    models = {"qwen": download_qwen()}
+    if include_ocr:
+        models["ocr"] = download_ocr()
+    return models
 
 
+@timed_pipeline("invoice_pipeline")
 def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path=None,
                  backend="catalog", models=None, retriever=None, generate=None, progress=None):
     """Process all invoices. Inject models/retriever/generate for controlled runs."""
@@ -28,14 +33,13 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
     report = progress or (lambda stage: None)
     connection = None
     # Serialize calls sharing process-local GPU models.
-    with PIPELINE_LOCK:
+    with timed_lock(PIPELINE_LOCK, "pipeline_lock_wait"):
         try:
             report("loading_models")
-            models = models if models is not None else download_models()
+            models = models if models is not None else download_models(include_ocr=False)
             if generate is None:
                 generate = make_generator(**models["qwen"])
-            report("running_ocr")
-            extract_doc(pdf, destination, models["ocr"])
+            extract_doc(pdf, destination, models.get("ocr"), progress=report)
             report("cleaning_text")
             cleaned = clean_extracted_text(destination)
             report("extracting_json")
@@ -45,8 +49,10 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
                 report("identifying_products")
                 from .product_pipeline import identify_products
 
+                # The nested pipeline's completion is not completion of the invoice.
                 product_results = identify_products(parsed, destination / "product_identification.json",
-                                                     generate=generate, progress=report)
+                                                     generate=generate,
+                                                     progress=lambda stage: report(stage) if stage != "completed" else None)
                 for product in product_results["products"]:
                     item = parsed["invoices"][product["invoice_index"]]["item_level"][product["item_index"]]
                     identification = product["identification"]
@@ -57,15 +63,16 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
                     )
             if retriever is None and missing_codes:
                 report("loading_tariff_index")
-                if backend == "catalog":
-                    retriever = CatalogRetriever.load(catalog_path or os.getenv("HS_CATALOG_PATH"),
-                                                      national_path or os.getenv("NATIONAL_INDEX_PATH"))
-                elif backend == "weaviate":
-                    from .db_connect import connect_vdb
-                    connection = connect_vdb()["weaviate_client"]
-                    retriever = WeaviateRetriever(connection, WeaviateRetriever.load_country_map())
-                else:
-                    raise ValueError(f"Unknown retrieval backend: {backend}")
+                with timed_stage("loading_tariff_index", backend=backend):
+                    if backend == "catalog":
+                        retriever = CatalogRetriever.load(catalog_path or os.getenv("HS_CATALOG_PATH"),
+                                                          national_path or os.getenv("NATIONAL_INDEX_PATH"))
+                    elif backend == "weaviate":
+                        from .db_connect import connect_vdb
+                        connection = connect_vdb()["weaviate_client"]
+                        retriever = WeaviateRetriever(connection, WeaviateRetriever.load_country_map())
+                    else:
+                        raise ValueError(f"Unknown retrieval backend: {backend}")
             report("retrieving_tariffs")
             matches = fetch_hts(parsed, retriever)
             save_json(destination / "db_matches.json", matches)
@@ -76,7 +83,8 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
             return result
         finally:
             if connection is not None:
-                connection.close()
+                with timed_stage("closing_tariff_connection"):
+                    connection.close()
 
 
 hts_classification_pipeline = doc_pipeline

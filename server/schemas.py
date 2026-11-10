@@ -129,6 +129,7 @@ class GPUConfiguration(BaseModel):
     cuda_visible_devices: str | None = None
     cuda_device_order: str | None = None
     bf16_hardware_supported: bool | None = None
+    ocr_device: str = "gpu:0"
     ocr_gpu_ready: bool | None = None
     loaded_models: dict[str, bool]
     checks: list[GPUConfigCheck]

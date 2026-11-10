@@ -184,13 +184,19 @@ Each invoice connection handles exactly one PDF. Open another connection for the
 | Stage | Meaning |
 | --- | --- |
 | `loading_tariff_index` | Prepare the tariff catalog or Weaviate connection and country mapping |
-| `loading_models` | Obtain OCR and Qwen models; previously loaded models are reused |
-| `running_ocr` | Render PDF pages and extract text |
+| `loading_models` | Load or reuse Qwen |
+| `extracting_pdf_text` | Check native PDF text per page |
+| `loading_ocr_model` | Load or reuse PaddleOCR only when needed |
+| `running_ocr` | Recognize fallback page images with PaddleOCR |
 | `cleaning_text` | Remove OCR markup and retain usable text |
 | `extracting_json` | Generate and validate structured invoice JSON |
+| `identifying_products` / `identifying_product` | Build product profiles and search queries when lookup is needed |
+| `loading_product_model` | Load or reuse Qwen for standalone product identification |
 | `retrieving_tariffs` | Find tariff candidates for the extracted items |
 | `classifying_items` | Select and validate tariff codes |
 | `completed` | Pipeline processing has finished |
+
+Native-only PDFs skip the OCR model-loading and recognition stages. Clients should tolerate additional stage names. Model names and settings are defined in [`AI/model_config.py`](../AI/model_config.py); see the [configuration reference](../AI/README.md#model-configuration).
 
 A `progress` message with stage `completed` is not the result message. Wait for `event: "completed"` and read its `result` field. Progress messages mark stages, not percentage completion, and a stage can take a long time without producing more application messages.
 
@@ -369,7 +375,7 @@ Events have the shape `{"event":"gpu_status","data":{...}}`. The `data` object m
 | `in_use` | A monitored GPU has a compute process or positive utilization |
 | `active` | GPU utilization is above zero at the sampled time |
 | `gpus` | Device names, memory in MiB, utilization percentages, temperature, power, and compute processes |
-| `configuration` | Python/PyTorch/CUDA versions, CUDA visibility, BF16 readiness, and loaded-model flags |
+| `configuration` | Python/PyTorch/CUDA versions, CUDA visibility, informational BF16 support, Paddle device, and loaded-model flags |
 | `errors` | Missing driver or unavailable telemetry diagnostics |
 
 A model can remain in GPU memory while `active` is false. Unknown metrics are null, not zero. Monitoring does not load AI models or allocate GPU tensors. It reports model-loaded flags for the API worker serving the socket, not every process on the host. See [the server guide](README.md#gpu-availability-and-live-usage) for field definitions and readiness limits.

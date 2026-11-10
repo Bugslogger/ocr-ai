@@ -140,11 +140,21 @@ class SocketIOTests(TestCase):
         folder = Path(self.directory.name) / job.job_id
         asyncio.run(self.transport.get("disconnected-client", {"job_id": job.job_id}))
         self.assertTrue((folder / "job.json").exists())
-        with self.connection() as ws:
+        cleanup_finished = Event()
+        original_cleanup = self.jobs.cleanup_delivered
+
+        def cleanup(job_id):
+            original_cleanup(job_id)
+            cleanup_finished.set()
+
+        with patch.object(self.jobs, "cleanup_delivered", side_effect=cleanup), self.connection() as ws:
             self.send(ws, "invoice:get", {"job_id": job.job_id})
             self.assertEqual(self.event(ws, "invoice:details")["job"]["result"], extracted_result())
             self.send(ws, "gpu:get", {})
             self.event(ws, "gpu:status")
+            # Socket.IO handlers run concurrently; a GPU response is not proof
+            # that the invoice handler's post-delivery cleanup has completed.
+            self.assertTrue(cleanup_finished.wait(2))
         self.assertFalse(folder.exists())
 
     def test_extra_arguments_return_error_and_ack_without_closing_connection(self):

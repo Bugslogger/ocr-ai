@@ -1,8 +1,8 @@
-"""Runtime configuration. Importing this module performs no I/O."""
+"""Database configuration and compatibility imports for model settings."""
 import os
 
-Qconfig = {"max_new_tokens": 15000, "temperature": 0.0}
-Oconfig = {"max_length": 15000, "image_size": 1024, "dpi": 350}
+from .model_config import Qconfig, Qruntime, Oconfig
+
 db = {
     "host": os.getenv("WEAVIATE_HOST", "32.236.127.40"),
     "http_port": int(os.getenv("WEAVIATE_HTTP_PORT", "8080")),

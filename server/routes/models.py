@@ -6,7 +6,8 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from server.schemas import ModelStatus, ModelsStatusResponse, ModelDownloadResponse
-from AI.model import MODEL_DEFAULTS, model_spec, model_cache_dir
+from AI.model_config import MODEL_DEFAULTS
+from AI.model import model_spec, model_cache_dir
 
 router = APIRouter(prefix="/models", tags=["Models"])
 
@@ -34,6 +35,9 @@ def _snapshot_dirs(location: Path) -> list[Path]:
 
 
 def _is_downloaded(snapshot: Path) -> bool:
+    if (snapshot / "inference.pdiparams").is_file():
+        return ((snapshot / "inference.yml").is_file()
+                and (snapshot / "inference.json").is_file())
     if not (snapshot / "config.json").is_file():
         return False
     for filename in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
@@ -48,7 +52,7 @@ def _is_downloaded(snapshot: Path) -> bool:
 
 
 @router.post("/download", response_model=ModelDownloadResponse,
-             summary="Download both model repositories to disk without loading models",
+             summary="Download OCR detection, recognition, and Qwen without loading models",
              responses={502: {"description": "Model repository download failed"}})
 def download_models() -> ModelDownloadResponse:
     from AI.model import download_model_files
