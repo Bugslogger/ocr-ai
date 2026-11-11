@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from threading import Event
+from threading import Event, Lock
 from unittest import TestCase, main
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
@@ -23,7 +23,7 @@ class InvoiceJobTests(TestCase):
     def setUp(self):
         self.directory = TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.service = InvoiceJobService(root=self.directory.name)
+        self.service = InvoiceJobService(root=self.directory.name, workers=1)
         self.route_patch = patch("server.routes.invoices.invoice_jobs", self.service)
         self.route_patch.start()
         self.addCleanup(self.route_patch.stop)
@@ -276,6 +276,70 @@ class InvoiceJobTests(TestCase):
             self.assertEqual(self.terminal(first).status, JobStatus.SUCCEEDED)
             self.assertEqual(self.terminal(second).status, JobStatus.SUCCEEDED)
             self.assertEqual(self.terminal(third).status, JobStatus.SUCCEEDED)
+
+    def test_two_workers_extract_while_remaining_jobs_wait_in_fifo_order(self):
+        from AI.model import cached_models, pipeline_lock, ocr_lock
+
+        self.service.worker_count = 2
+        started = [Event() for _ in range(4)]
+        release = [Event() for _ in range(4)]
+        guard = Lock()
+        calls = []
+        runtimes = []
+
+        def pipeline(*args, **kwargs):
+            with guard:
+                index = len(calls)
+                calls.append(index)
+                runtimes.append((cached_models(), pipeline_lock(), ocr_lock()))
+            started[index].set()
+            if not release[index].wait(5):
+                raise RuntimeError("Test did not release invoice")
+            return extracted_result()
+
+        jobs = []
+        with patch("AI.main.doc_pipeline", side_effect=pipeline):
+            try:
+                for index in range(2):
+                    jobs.append(self.submit().json()["job_id"])
+                    self.assertTrue(started[index].wait(2))
+                    self.assertEqual(self.service.get(jobs[index]).status, JobStatus.PROCESSING)
+                for _ in range(2):
+                    jobs.append(self.submit().json()["job_id"])
+                self.assertEqual(self.service.get(jobs[2]).queue_position, 1)
+                self.assertEqual(self.service.get(jobs[3]).queue_position, 2)
+                self.assertEqual(len(calls), 2)
+                for first, second in zip(runtimes[0], runtimes[1]):
+                    self.assertIsNot(first, second)
+                release[0].set()
+                self.assertTrue(started[2].wait(2))
+                self.assertEqual(self.service.get(jobs[2]).status, JobStatus.PROCESSING)
+                self.assertEqual(self.service.get(jobs[3]).queue_position, 1)
+                self.assertFalse(started[3].is_set())
+                self.assertFalse(release[1].is_set())
+                for initial, reused in zip(runtimes[0], runtimes[2]):
+                    self.assertIs(initial, reused)
+                release[1].set()
+                self.assertTrue(started[3].wait(2))
+            finally:
+                for event in release:
+                    event.set()
+                for job_id in jobs:
+                    self.terminal(job_id)
+            for job_id in jobs:
+                self.assertEqual(self.service.get(job_id).status, JobStatus.SUCCEEDED)
+
+    def test_worker_configuration(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(InvoiceJobService(root=self.directory.name).worker_count, 2)
+            with patch("server.config.INVOICE_WORKERS", 4):
+                self.assertEqual(InvoiceJobService(root=self.directory.name).worker_count, 4)
+        with patch.dict(os.environ, {"INVOICE_WORKERS": "3"}):
+            self.assertEqual(InvoiceJobService(root=self.directory.name).worker_count, 3)
+            self.assertEqual(InvoiceJobService(root=self.directory.name, workers=1).worker_count, 1)
+        for value in (0, -1, "invalid"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                InvoiceJobService(root=self.directory.name, workers=value)
 
     def test_failed_ocr_does_not_poison_next_queued_invoice(self):
         from AI.utils import extract_doc

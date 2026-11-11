@@ -131,13 +131,14 @@ class GPUMonitor:
             from AI.model_config import Oconfig
             ready = None if Oconfig["device"].startswith("gpu") else False
             from AI import model
+            loaded_models = model.loaded_model_kinds()
             configuration = {
                 **runtime, "cuda_driver_version": telemetry["driver_cuda"],
                 "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
                 "cuda_device_order": os.getenv("CUDA_DEVICE_ORDER"),
                 "bf16_hardware_supported": bf16,
                 "ocr_device": Oconfig["device"], "ocr_gpu_ready": ready,
-                "loaded_models": {kind: kind in model._models for kind in ("ocr", "qwen")},
+                "loaded_models": {kind: kind in loaded_models for kind in ("ocr", "qwen")},
                 "checks": [
                     {"name": "cuda", "passed": cuda, "detail": "PyTorch can access a CUDA device"},
                     {"name": "bf16_hardware", "passed": bf16,

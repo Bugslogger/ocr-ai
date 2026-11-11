@@ -10,15 +10,17 @@ import os
 import re
 import shutil
 
+from server import config
 from server.schemas import InvoiceExtractionResponse, InvoiceJobResponse, JobStatus
 from server.services.invoices import InvoiceProcessor
 from AI.performance import performance_run, timed_stage, record_timing
+from AI.model import model_context
 
 logger = logging.getLogger(__name__)
 
 STAGES = {
     "queued": (0, "Waiting in the invoice queue"),
-    "starting": (1, "Worker started; waiting for the shared pipeline if busy"),
+    "starting": (1, "Worker started invoice extraction"),
     "loading_tariff_index": (70, "Loading tariff reference data for codes missing from the invoice"),
     "loading_models": (10, "Loading or reusing Qwen"),
     "extracting_pdf_text": (15, "Extracting embedded PDF text; checking pages for OCR fallback"),
@@ -38,7 +40,10 @@ STAGES = {
 
 
 class InvoiceJobService:
-    def __init__(self, root=None, processor=None):
+    def __init__(self, root=None, processor=None, workers=None):
+        self.worker_count = int(workers if workers is not None else os.getenv("INVOICE_WORKERS", config.INVOICE_WORKERS))
+        if self.worker_count < 1:
+            raise ValueError("INVOICE_WORKERS must be a positive integer")
         self.root = Path(root or os.getenv("INVOICE_JOB_DIR") or
                          Path(__file__).resolve().parents[2] / "output" / "invoice_jobs").expanduser().resolve()
         self.processor = processor or InvoiceProcessor()
@@ -46,7 +51,7 @@ class InvoiceJobService:
         self._queue = Queue()
         self._pending = []
         self._lock = RLock()
-        self._worker = None
+        self._workers = []
         self._delivered = {}
         self._subscribers = {}
 
@@ -122,9 +127,11 @@ class InvoiceJobService:
                 self._save(job_id, data)
                 self._pending.append(job_id)
                 self._queue.put(job_id)
-                if self._worker is None or not self._worker.is_alive():
-                    self._worker = Thread(target=self._work, name="invoice-jobs", daemon=True)
-                    self._worker.start()
+                self._workers = [worker for worker in self._workers if worker.is_alive()]
+                while len(self._workers) < self.worker_count:
+                    worker = Thread(target=self._work, name=f"invoice-jobs-{len(self._workers) + 1}", daemon=True)
+                    worker.start()
+                    self._workers.append(worker)
                 # Return the acceptance snapshot before the worker can take the lock.
                 job.queue_position = self._pending.index(job_id) + 1
                 return job
@@ -191,6 +198,10 @@ class InvoiceJobService:
                 logger.exception("Could not remove delivered invoice job %s", job_id)
 
     def _work(self):
+        with model_context():
+            self._work_loop()
+
+    def _work_loop(self):
         while True:
             job_id = self._queue.get()
             try:

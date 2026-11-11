@@ -7,8 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .main import PIPELINE_LOCK
-from .model import download_qwen
+from .model import download_qwen, pipeline_lock
 from .utils import make_generator, parse_json_maybe, save_json
 from .performance import timed_pipeline, timed_lock
 from .model_config import PRODUCT_GENERATION_CONFIG
@@ -103,7 +102,7 @@ def identify_products(invoice_data, output_path=None, *, generate=None, progress
     Draft202012Validator(input_schema).validate(invoice_data)
     report = progress or (lambda stage: None)
     products = []
-    with timed_lock(PIPELINE_LOCK, "product_pipeline_lock_wait"):
+    with timed_lock(pipeline_lock(), "product_pipeline_lock_wait"):
         for invoice_index, invoice in enumerate(invoice_data["invoices"]):
             for item_index, item in enumerate(invoice["item_level"]):
                 if generate is None and any((item.get(key) or "").strip() for key in

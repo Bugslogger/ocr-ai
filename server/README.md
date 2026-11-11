@@ -85,7 +85,7 @@ Example event while waiting:
 }
 ```
 
-- `queue_position`: `1` is the next waiting job; `2` means one waiting job is ahead, plus any job already processing. `0` means the worker has taken the job, though it can still wait for the shared pipeline lock. Terminal jobs use null. Position is also null if a queued job belongs to another process whose queue cannot be inspected.
+- `queue_position`: `1` is the next waiting job; `2` means one waiting job is ahead, in addition to active jobs. `0` means an extraction worker has taken the job. Two workers process invoices concurrently by default. Terminal jobs use null. Position is also null if a queued job belongs to another process whose queue cannot be inspected.
 - `progress_percent` is a **stage-based estimate**, not measured page/item completion or an elapsed-time prediction. It remains unchanged during a long stage. Stages use 0 (queued), 1 (starting), 10 (Qwen loading/reuse), 15 (native text checks), 18 (OCR loading when needed), 20 (OCR), 45 (text cleanup), 55 (JSON extraction), 60 (product identification), 70 (tariff setup), 75 (retrieval), 85 (classification), and 99 (finalization). Only saved success reaches 100. Failures retain the last recorded estimate.
 - `stage` is the machine-readable stage; `stage_description` explains what is processing.
 - The socket immediately sends the current snapshot and sends another at the selected interval (1–60 seconds, default 1). Intermediate stages shorter than that interval may be skipped. Repeated unchanged snapshots also keep the connection active.
@@ -314,7 +314,11 @@ with httpx.Client(timeout=60) as client:
         time.sleep(2)
 ```
 
-The worker runs the same `InvoiceProcessor` and `AI.main.doc_pipeline()` as the direct HTTP and WebSocket endpoints. Jobs run serially in one background thread per API process; invoice processing still shares the pipeline's GPU lock. Closing the upload/polling HTTP connection does not cancel the accepted job.
+Background jobs use **two extraction workers by default** in one API process. Two invoices can process simultaneously; additional invoices wait in the FIFO queue until either worker is free. Set `INVOICE_WORKERS` to a positive integer before starting the API to change this limit (use `1` for serial processing). This applies to `/api/v1/invoices/jobs`, the default asynchronous `/api/v1/invoices/extract`, and Socket.IO invoice submissions. Closing an upload or polling connection does not cancel an accepted job.
+
+You can also edit `INVOICE_WORKERS = 2` in `server/config.py` to choose the default worker count. The `INVOICE_WORKERS` environment variable overrides that file setting. For example, start four extraction workers with `INVOICE_WORKERS=4 server/venv/bin/python -m uvicorn server.app:app --host 0.0.0.0 --port 8000 --workers 1` from the repository root. Restart the API after changing the count.
+
+Each extraction worker lazily loads and reuses its own Qwen and PaddleOCR model copies and inference locks. This allows real inference overlap without sharing mutable predictors. GPU memory must accommodate both model copies and both active invoices' generation caches. Cold model loading is serialized; once initialized, inference runs concurrently. MuPDF parsing/rendering remains protected by a short shared lock. Keep one Uvicorn process; `--workers 2` would create separate queues and double the configured extraction workers. Explicit synchronous requests and legacy direct-upload WebSockets retain their separate shared model bundle and do not use this queue.
 
 Job metadata and final results are saved atomically under `INVOICE_JOB_DIR`, which defaults to `/workspace/output/invoice_jobs`. The uploaded PDF is deleted when processing finishes. After a successful final result is sent by HTTP polling, WebSocket, or Socket.IO, that job's entire directory is deleted. The initial `202` and progress messages do not trigger deletion. Failed jobs and successful results that have not been sent remain on disk. Cleanup never removes another job's directory.
 
@@ -437,7 +441,7 @@ sequenceDiagram
     API-->>Client: 200 application/json
 ```
 
-In Weaviate mode the AI pipeline opens its database connection before loading the models, queries candidates after extraction, and closes the connection in a `finally` block. The route runs its blocking upload processing and inference in FastAPI's worker thread pool, allowing async health and status routes to continue serving requests. Full pipeline inference is serialized by the shared AI pipeline lock.
+In Weaviate mode each invoice owns its database connection and closes it in a `finally` block. Blocking upload processing and inference run off the event loop, allowing async health and status routes to continue serving requests. Background extraction workers use independent model bundles and pipeline locks; direct synchronous and legacy upload-socket calls share the default bundle and lock.
 
 `server/routes/invoices.py` defines the HTTP contract. `server/services/invoices.py` validates and stages the upload, then calls the shared `AI.main.doc_pipeline()`. User filenames are never used as storage paths. Each request owns a temporary directory that is removed on success and failure; uploaded PDFs and JSON artifacts are not retained by this endpoint. The existing path-based OCR jobs retain their own output files.
 
@@ -447,6 +451,7 @@ In Weaviate mode the AI pipeline opens its database connection before loading th
 | --- | --- | --- |
 | `INVOICE_TARIFF_BACKEND` | `weaviate` | Use the configured DB, or choose `catalog` |
 | `INVOICE_JOB_DIR` | `/workspace/output/invoice_jobs` | Persisted full-pipeline job status and JSON results |
+| `INVOICE_WORKERS` | `2` | Concurrent background extraction workers per API process; additional invoices wait in FIFO order |
 | `INVOICE_MAX_UPLOAD_BYTES` | `26214400` | Maximum invoice file size, 25 MiB, checked while copying the parsed upload |
 | `WEAVIATE_HOST` | `32.236.127.40` | HTTP and gRPC host |
 | `WEAVIATE_HTTP_PORT` | `8080` | HTTP port |

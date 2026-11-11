@@ -8,9 +8,9 @@ import re
 from threading import RLock
 from .performance import timed_stage, timed_pipeline, timed_lock
 from .model_config import GENERATION_DEFAULTS, QWEN_CHAT_TEMPLATE_CONFIG
+from .model import ocr_lock
 
-# Protect process-local Paddle predictors and MuPDF rendering across jobs.
-OCR_LOCK = RLock()
+# Protect MuPDF rendering across threads; Paddle locks belong to each worker.
 PDF_LOCK = RLock()
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ def extract_doc(doc_path, output_path, model=None, *, progress=None, force_ocr=F
                 report("loading_ocr_model")
                 model = download_ocr()
             report("running_ocr")
-            with timed_lock(OCR_LOCK, "ocr_lock_wait"):
+            with timed_lock(ocr_lock(), "ocr_lock_wait"):
                 pipeline = _model_part(model, "ocr_model")
                 for index, path in zip(missing, paths):
                     with timed_stage("ocr_page", page=index + 1):

@@ -1,17 +1,14 @@
 """Full PDF pipeline and CLI. Importing this module loads no models or database."""
 from pathlib import Path
-from threading import RLock
 from uuid import uuid4
 import argparse
 import os
 
-from .model import download_ocr, download_qwen
+from .model import download_ocr, download_qwen, pipeline_lock
 from .tariff import CatalogRetriever, WeaviateRetriever, needs_tariff_lookup
 from .utils import (extract_doc, clean_extracted_text, format_json, make_generator,
                     fetch_hts, update_invoice, save_json)
 from .performance import timed_pipeline, timed_stage, timed_lock
-
-PIPELINE_LOCK = RLock()
 
 
 def download_models(*, include_ocr=True):
@@ -32,8 +29,8 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
     destination.mkdir(parents=True, exist_ok=True)
     report = progress or (lambda stage: None)
     connection = None
-    # Serialize calls sharing process-local GPU models.
-    with timed_lock(PIPELINE_LOCK, "pipeline_lock_wait"):
+    # Serialize only calls sharing the same model bundle; workers own copies.
+    with timed_lock(pipeline_lock(), "pipeline_lock_wait"):
         try:
             report("loading_models")
             models = models if models is not None else download_models(include_ocr=False)

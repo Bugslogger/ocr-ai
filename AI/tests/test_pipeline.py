@@ -1,8 +1,10 @@
 """Regression tests using tiny local PDFs and fake model/database responses."""
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Barrier
 from types import SimpleNamespace, ModuleType
 from unittest import TestCase, main
 from unittest.mock import Mock, patch
@@ -45,6 +47,68 @@ def make_pdf(path):
             page = document.new_page(width=72, height=72)
             page.insert_text((5, 20), "Invoice", fontsize=8)
         document.save(path)
+
+
+class WorkerConcurrencyTests(TestCase):
+    def test_workers_cache_separate_ocr_predictors(self):
+        from AI import model
+
+        paddleocr = ModuleType("paddleocr")
+        paddleocr.PaddleOCR = Mock(side_effect=[Mock(), Mock()])
+        hub = ModuleType("huggingface_hub")
+        hub.snapshot_download = Mock(return_value="/fake/model")
+        with patch.dict(sys.modules, {"paddleocr": paddleocr, "huggingface_hub": hub}), patch.dict(
+            model._models, {}, clear=True
+        ):
+            bundles = []
+            for _ in range(2):
+                with model.model_context():
+                    bundle = model.download_ocr()
+                    self.assertIs(bundle, model.download_ocr())
+                    self.assertIn("ocr", model.loaded_model_kinds())
+                    bundles.append(bundle)
+            self.assertIsNot(bundles[0]["ocr_model"], bundles[1]["ocr_model"])
+            self.assertNotIn("ocr", model._models)
+            self.assertEqual(paddleocr.PaddleOCR.call_count, 2)
+
+    def test_real_pipeline_and_nested_product_stage_overlap_between_workers(self):
+        from AI.model import model_context, cached_models, pipeline_lock, ocr_lock
+        from AI.product_pipeline import identify_products
+
+        overlap = Barrier(2)
+
+        def identify(item, generate):
+            overlap.wait(timeout=3)
+            return {"search_query": "cable"}
+
+        def extract(*args, **kwargs):
+            # Exercise the nested product lock while the invoice lock is held.
+            identify_products({"invoices": [invoice()]}, generate=Mock())
+
+        def run(pdf, output):
+            with model_context():
+                cache = cached_models()
+                cache["qwen"] = {"worker": str(output)}
+                result = doc_pipeline(pdf, output, models={}, generate=Mock())
+                return result, cache, pipeline_lock(), ocr_lock()
+
+        with TemporaryDirectory() as folder:
+            pdf = Path(folder) / "invoice.pdf"
+            pdf.touch()
+            with patch("AI.product_pipeline._identify", side_effect=identify), patch(
+                "AI.main.extract_doc", side_effect=extract
+            ), patch("AI.main.clean_extracted_text", return_value="invoice"), patch(
+                "AI.main.format_json", return_value={"invoices": []}
+            ), patch("AI.main.fetch_hts", return_value=[]), patch(
+                "AI.main.update_invoice", return_value={"invoices": []}
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(run, pdf, Path(folder) / "first")
+                second = pool.submit(run, pdf, Path(folder) / "second")
+                results = [first.result(timeout=5), second.result(timeout=5)]
+            self.assertEqual(results[0][0], {"invoices": []})
+            self.assertEqual(results[1][0], {"invoices": []})
+            for left, right in zip(results[0][1:], results[1][1:]):
+                self.assertIsNot(left, right)
 
 
 class CountryMapTests(TestCase):

@@ -53,7 +53,7 @@ flowchart TD
 | `OCR_HTS_DB.ipynb`, `OCR_HTS.ipynb` | Notebook entry points calling `doc_pipeline()` |
 | `tests/test_pipeline.py` | Regression tests with small PDFs and fake model/database responses |
 
-Imports do not download models or contact databases. Qwen loads on the first full processing call; PaddleOCR loads only on the first page requiring OCR. Loaded models remain cached in that process. Full pipeline calls are serialized; OCR predictor calls share a lock for thread safety.
+Imports do not download models or contact databases. Qwen loads on the first full processing call; PaddleOCR loads only on the first page requiring OCR. Each background extraction worker caches its own models and inference locks, allowing two invoices to process concurrently by default. Direct calls outside a worker context share the default model cache and locks.
 
 PDF validation and rendering share a separate lock; a MuPDF compressed-stream warning triggers one fresh-open render attempt. Persistent decompression errors fail before the rendered images reach OCR.
 
@@ -167,14 +167,13 @@ After editing this file or setting environment variables, restart the API.
 Configuration changes do not replace objects already cached in a running worker.
 `POST /api/v1/models/download` downloads files; it does not switch a loaded model.
 Use `GET /api/v1/models/status` to inspect files and `/api/v1/gpu/status` to see
-which model bundles are loaded in the worker serving that request.
+which model bundles are loaded across extraction workers in that API process.
 
 ## Performance and memory settings
 
 
 The default configuration places PaddleOCR on `gpu:0` and Qwen3-8B on `cuda:0`, sharing the first visible GPU.
-Models are cached per process and full invoice inference is serialized to avoid
-concurrent KV caches. Native-only PDFs do not render images or load PaddleOCR.
+Background extraction uses `INVOICE_WORKERS=2` by default, with independent model copies and concurrent KV caches. GPU memory must accommodate both. Set `INVOICE_WORKERS=1` for serial processing. Use one Uvicorn process so all queued invoices share the same worker limit. Native-only PDFs do not render images or load PaddleOCR.
 `download_models(include_ocr=False)` loads only Qwen; the default helper call
 still explicitly loads both OCR and Qwen for callers that want to preload them.
 

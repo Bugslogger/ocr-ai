@@ -1,5 +1,7 @@
 """Lazy, process-local model loading. Failures propagate to the caller."""
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from threading import RLock
 from .performance import timed_pipeline
@@ -12,6 +14,47 @@ from .model_config import (
 _models = {}
 _lock = RLock()
 _file_download_lock = RLock()
+_runtime = ContextVar("model_runtime", default=None)
+_default_pipeline_lock = RLock()
+_default_ocr_lock = RLock()
+_worker_models = {}
+_runtime_lock = RLock()
+
+
+@contextmanager
+def model_context():
+    """Keep one worker's model copies and inference locks isolated for its lifetime."""
+    runtime = {"models": {}, "pipeline_lock": RLock(), "ocr_lock": RLock()}
+    token = _runtime.set(runtime)
+    with _runtime_lock:
+        _worker_models[id(runtime)] = runtime["models"]
+    try:
+        yield
+    finally:
+        with _runtime_lock:
+            _worker_models.pop(id(runtime), None)
+        _runtime.reset(token)
+
+
+def pipeline_lock():
+    runtime = _runtime.get()
+    return runtime["pipeline_lock"] if runtime is not None else _default_pipeline_lock
+
+
+def ocr_lock():
+    runtime = _runtime.get()
+    return runtime["ocr_lock"] if runtime is not None else _default_ocr_lock
+
+
+def cached_models():
+    runtime = _runtime.get()
+    return runtime["models"] if runtime is not None else _models
+
+
+def loaded_model_kinds():
+    """Report models loaded in any extraction worker without loading new ones."""
+    with _runtime_lock:
+        return set(_models).union(*(set(models) for models in _worker_models.values()))
 
 
 def model_spec(kind):
@@ -50,7 +93,8 @@ def download_model_files():
 def download_ocr():
     """Load the two-model PaddleOCR pipeline once on the configured device."""
     with _lock:
-        if "ocr" not in _models:
+        models = cached_models()
+        if "ocr" not in models:
             for setting, value in PADDLE_ENV_CONFIG.items():
                 os.environ.setdefault(setting, value)
             from huggingface_hub import snapshot_download
@@ -68,14 +112,15 @@ def download_ocr():
                 **OCR_PIPELINE_CONFIG,
                 text_recognition_batch_size=Oconfig["recognition_batch_size"],
             )
-            _models["ocr"] = {"ocr_model": pipeline}
-        return _models["ocr"]
+            models["ocr"] = {"ocr_model": pipeline}
+        return models["ocr"]
 
 
 @timed_pipeline("loading_qwen_model")
 def download_qwen():
     with _lock:
-        if "qwen" not in _models:
+        models = cached_models()
+        if "qwen" not in models:
             import torch
             from transformers import (
                 AutoModelForCausalLM,
@@ -129,9 +174,9 @@ def download_qwen():
                 **options
             ).eval()
 
-            _models["qwen"] = {
+            models["qwen"] = {
                 "Qtokenizer": tokenizer,
                 "Qmodel": model,
             }
 
-        return _models["qwen"]
+        return models["qwen"]
