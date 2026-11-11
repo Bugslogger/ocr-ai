@@ -8,7 +8,7 @@ import os
 MODEL_DEFAULTS = {
     "ocr_det": "PaddlePaddle/PP-OCRv5_mobile_det",
     "ocr_rec": "PaddlePaddle/en_PP-OCRv5_mobile_rec",
-    "qwen": "Qwen/Qwen3-8B",
+    "qwen": "Qwen/Qwen2.5-14B-Instruct-1M",
 }
 
 MODEL_REVISIONS = {kind: None for kind in MODEL_DEFAULTS}

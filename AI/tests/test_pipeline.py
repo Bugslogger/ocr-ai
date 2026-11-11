@@ -84,6 +84,7 @@ class WorkerConcurrencyTests(TestCase):
         def extract(*args, **kwargs):
             # Exercise the nested product lock while the invoice lock is held.
             identify_products({"invoices": [invoice()]}, generate=Mock())
+            (args[1] / "extracted_text.txt").write_text("invoice", encoding="utf-8")
 
         def run(pdf, output):
             with model_context():
@@ -97,7 +98,7 @@ class WorkerConcurrencyTests(TestCase):
             pdf.touch()
             with patch("AI.product_pipeline._identify", side_effect=identify), patch(
                 "AI.main.extract_doc", side_effect=extract
-            ), patch("AI.main.clean_extracted_text", return_value="invoice"), patch(
+            ), patch(
                 "AI.main.format_json", return_value={"invoices": []}
             ), patch("AI.main.fetch_hts", return_value=[]), patch(
                 "AI.main.update_invoice", return_value={"invoices": []}
@@ -167,7 +168,7 @@ class CountryMapTests(TestCase):
 class TariffTests(TestCase):
     def test_three_country_invoice_uses_manufacturing_origin_not_export(self):
         inv = invoice()
-        inv["order_level"].update(origin_country="United Kingdom", shipper_country="United Kingdom",
+        inv["order_level"].update(origin_country="China", export_country="United Kingdom", shipper_country="United Kingdom",
                                   destination_country="Australia", receiver_country="Australia")
         item = inv["item_level"][0]
         item["country_of_manufacture"] = "China"
@@ -376,7 +377,7 @@ class ExternalBoundaryTests(TestCase):
         client.collections.get.return_value.query = query
         matches = WeaviateRetriever(client, {"CN": "41", "GB": "225", "AU": "14"}).retrieve(
             {"product_description": "Electric cable", "country_of_manufacture": "China", "hs_code": "8544"},
-            {"origin_country": "United Kingdom", "shipper_country": "United Kingdom", "destination_country": "Australia"})
+            {"origin_country": "China", "export_country": "United Kingdom", "shipper_country": "United Kingdom", "destination_country": "Australia"})
         self.assertEqual(matches["origin_iso"], "CN")
         self.assertEqual({call.kwargs["filters"].value for call in query.bm25.call_args_list}, {"41", "14"})
         self.assertEqual({call.kwargs["filters"].filters[0].value for call in query.fetch_objects.call_args_list}, {"41", "14"})
@@ -517,6 +518,44 @@ class ExternalBoundaryTests(TestCase):
         tokenizer.apply_chat_template.assert_called_with(
             [], tokenize=False, add_generation_prompt=True, enable_thinking=False)
 
+    def test_qwen_greedy_generation_clears_inherited_sampling_flags(self):
+        import torch
+        from transformers import GenerationConfig
+
+        class Encoded(dict):
+            @property
+            def input_ids(self):
+                return self["input_ids"]
+
+            def to(self, device):
+                return self
+
+        tokenizer = Mock()
+        tokenizer.eos_token_id = 9
+        tokenizer.return_value = Encoded(input_ids=torch.tensor([[1, 2, 3]]))
+        tokenizer.decode.return_value = '{"ok":true}'
+        model = Mock()
+        model.device = torch.device("cpu")
+        model.config.max_position_embeddings = 20
+
+        def generate(**kwargs):
+            # Simulate generate() merging call options with pretrained defaults.
+            config = GenerationConfig(do_sample=True, temperature=0.7, top_p=0.8, top_k=20)
+            config.update(**{key: value for key, value in kwargs.items() if key != "input_ids"})
+            config.validate(strict=True)
+            self.assertEqual(config.do_sample, sampling)
+            if sampling:
+                self.assertEqual((config.temperature, config.top_p, config.top_k), (0.5, 0.8, 20))
+            else:
+                self.assertEqual((config.temperature, config.top_p, config.top_k), (None, None, None))
+            return torch.tensor([[1, 2, 3, 9]])
+
+        model.generate.side_effect = generate
+        for sampling, temperature in ((False, 0.0), (True, 0.5)):
+            with self.subTest(sampling=sampling):
+                self.assertEqual(qwen_generate([], tokenizer, model, max_new_tokens=4,
+                                               temperature=temperature), '{"ok":true}')
+
     def test_qwen_8b_is_quantized_on_one_gpu_and_cached(self):
         import torch
         from AI import model as module
@@ -534,7 +573,7 @@ class ExternalBoundaryTests(TestCase):
             first = module.download_qwen()
             self.assertIs(first, module.download_qwen())
         options = transformers.AutoModelForCausalLM.from_pretrained.call_args.kwargs
-        self.assertEqual(transformers.AutoModelForCausalLM.from_pretrained.call_args.args[0], "Qwen/Qwen3-8B")
+        self.assertEqual(transformers.AutoModelForCausalLM.from_pretrained.call_args.args[0], "Qwen/Qwen2.5-14B-Instruct-1M")
         self.assertEqual(options["device_map"], {"": "cuda:0"})
         self.assertEqual(options["attn_implementation"], "sdpa")
         transformers.BitsAndBytesConfig.assert_called_once_with(
@@ -611,6 +650,29 @@ class PipelineTests(TestCase):
             model.predict.assert_not_called()
             self.assertFalse(list((Path(folder) / "out").glob("pages_*")))
 
+    def test_origin_and_export_have_separate_extraction_fields(self):
+        from AI.schema import COUNTRY_DESCRIPTIONS
+
+        inv = invoice()
+        inv["order_level"].update(origin_country="China", export_country="United Kingdom",
+                                  destination_country="Australia")
+        inv["item_level"][0]["country_of_manufacture"] = "China"
+        generate = Mock(return_value=json.dumps({"invoices": [inv]}))
+        result = format_json(
+            cleaned_text="Country of Export: United Kingdom\nCountry of Origin: China\nShip To: Australia",
+            generate=generate,
+        )["invoices"][0]
+        self.assertEqual(result["order_level"]["origin_country"], "China")
+        self.assertEqual(result["order_level"]["export_country"], "United Kingdom")
+        self.assertEqual(result["item_level"][0]["country_of_manufacture"], "China")
+        system = generate.call_args.args[0][0]["content"]
+        self.assertIn('order_level.origin_country="China"', system)
+        self.assertIn('order_level.export_country="United Kingdom"', system)
+        contract = json.loads(system.split("JSON Schema:\n", 1)[1])
+        fields = contract["properties"]["invoices"]["items"]["properties"]["order_level"]["properties"]
+        for field in ("origin_country", "export_country"):
+            self.assertEqual(fields[field]["description"], COUNTRY_DESCRIPTIONS[field])
+
     def test_expanded_order_fields_are_extracted_without_changing_values(self):
         order = {
             "company_name": "Acme Corporation",
@@ -633,7 +695,7 @@ class PipelineTests(TestCase):
             "total_amount": 12500.0, "shipping_and_handling": None,
             "total_item_value": None, "dimensions_cm": "40 x 30 x 31",
             "origin_phone_code": "+1", "destination_phone_code": "+44",
-            "origin_country": "United States", "destination_country": "United Kingdom",
+            "origin_country": "United States", "destination_country": "United Kingdom", "export_country": "United States",
         }
         payload = {"invoices": [{**invoice(), "order_level": order}]}
         generate = Mock(return_value=json.dumps(payload))
@@ -695,7 +757,7 @@ class PipelineTests(TestCase):
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
             client = Mock()
-            with patch("AI.main.extract_doc"), patch("AI.main.clean_extracted_text", return_value="Invoice"), patch(
+            with patch("AI.main.extract_doc", side_effect=lambda pdf, output, *a, **kw: (output / "extracted_text.txt").write_text("Invoice", encoding="utf-8")), patch(
                 "AI.main.format_json", return_value={"invoices": [invoice()]}
             ), patch("AI.db_connect.connect_vdb", return_value={"weaviate_client": client}), patch(
                 "AI.main.WeaviateRetriever.load_country_map", side_effect=ConnectionError("country service unavailable")
@@ -705,6 +767,7 @@ class PipelineTests(TestCase):
             client.close.assert_called_once()
 
     def test_complete_invoice_codes_skip_db_catalog_and_classification(self):
+        extracted = "  Invoice <part> &amp;\t£100\n\nSecond page  "
         inv = invoice()
         inv["item_level"][0].update(hs_code="8544", manufacturing_country_hts_code="8544490000",
                                     destination_country_hts_code="8544490010")
@@ -712,13 +775,15 @@ class PipelineTests(TestCase):
         with TemporaryDirectory() as folder:
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
-            with patch("AI.main.extract_doc"), patch("AI.main.clean_extracted_text", return_value="Invoice"), patch(
+            with patch("AI.main.extract_doc", side_effect=lambda pdf, output, *a, **kw: (output / "extracted_text.txt").write_text(extracted, encoding="utf-8")), patch(
                 "AI.db_connect.connect_vdb", side_effect=AssertionError("DB must not be contacted")
             ) as connect, patch("AI.main.CatalogRetriever.load") as load_catalog:
                 result = doc_pipeline(pdf, Path(folder) / "out", backend="weaviate", models={"ocr": {}}, generate=generate)
             connect.assert_not_called()
             load_catalog.assert_not_called()
             generate.assert_called_once()  # Extraction only; no classification.
+            self.assertEqual(generate.call_args.args[0][1]["content"], "OCR Text:\n\n" + extracted)
+            self.assertFalse((Path(folder) / "out" / "plain_invoice_text.txt").exists())
             item = result["invoices"][0]["item_level"][0]
             self.assertEqual(item["hs_code"], "8544")
             self.assertEqual(item["manufacturing_country_hts_code"], "8544490000")
@@ -768,7 +833,7 @@ class PipelineTests(TestCase):
             ) as load_qwen:
                 result = DocumentProcessor().process(pdf, output, lambda stage: None)
             load_qwen.assert_not_called()
-            self.assertEqual(Path(result["plain_text_path"]).read_text(), "Invoice data\nInvoice data")
+            self.assertEqual(Path(result["plain_text_path"]).read_text(), "Invoice data\n\nInvoice data")
 
     def test_import_and_help_have_no_model_or_network_side_effects(self):
         code = "import sys; import AI.main; assert 'torch' not in sys.modules; assert 'transformers' not in sys.modules; assert 'weaviate' not in sys.modules; assert 'paddleocr' not in sys.modules; assert 'paddle' not in sys.modules"
@@ -776,8 +841,46 @@ class PipelineTests(TestCase):
         subprocess.run([sys.executable, "-m", "AI.main", "--help"], check=True, stdout=subprocess.DEVNULL)
 
     def test_schema_failure_is_explicit(self):
+        generate = Mock(return_value='{"invoices":[]}')
         with self.assertRaisesRegex(ValueError, "Invalid invoice JSON"):
-            format_json(cleaned_text="Invoice", generate=Mock(return_value='{"invoices":[]}'))
+            format_json(cleaned_text="Invoice", generate=generate)
+        generate.assert_called_once()
+
+    def test_invalid_json_regenerates_complete_invoice_and_keeps_diagnostics(self):
+        payload = {"invoices": [invoice("FIRST"), invoice("SECOND")]}
+        valid = json.dumps(payload)
+        malformed = valid.replace('"total_amount": null', '"total_amount": ', 1)
+        generate = Mock(side_effect=[malformed, valid])
+        with TemporaryDirectory() as folder, self.assertLogs("AI.utils", level="WARNING"):
+            result = format_json(cleaned_text="Original invoice source", output_path=folder,
+                                 system_prompt="Custom extraction instructions", generate=generate)
+            self.assertEqual(result, payload)
+            self.assertEqual((Path(folder) / "invalid_invoice_response_1.txt").read_text(), malformed)
+            self.assertEqual(json.loads((Path(folder) / "extracted_invoice.json").read_text()), payload)
+        self.assertEqual(generate.call_count, 2)
+        retry = generate.call_args.args[0]
+        self.assertEqual(retry[0]["content"], "Custom extraction instructions")
+        self.assertIn("Original invoice source", retry[1]["content"])
+        self.assertIn("Expecting value", retry[1]["content"])
+        self.assertEqual(generate.call_args.kwargs, generate.call_args_list[0].kwargs)
+
+    def test_repeated_invalid_json_fails_without_saving_invoice(self):
+        generate = Mock(side_effect=['{"invoices": ', '```json\n{"invoices": [}\n```'])
+        with TemporaryDirectory() as folder, self.assertLogs("AI.utils", level="WARNING"):
+            with self.assertRaisesRegex(ValueError, "invalid JSON after 2 attempts") as raised:
+                format_json(cleaned_text="Invoice", output_path=folder, generate=generate)
+            self.assertIsInstance(raised.exception.__cause__, json.JSONDecodeError)
+            self.assertEqual((Path(folder) / "invalid_invoice_response_1.txt").read_text(), '{"invoices": ')
+            self.assertEqual((Path(folder) / "invalid_invoice_response_2.txt").read_text(),
+                             '```json\n{"invoices": [}\n```')
+            self.assertFalse((Path(folder) / "extracted_invoice.json").exists())
+        self.assertEqual(generate.call_count, 2)
+
+    def test_truncated_generation_is_not_retried(self):
+        generate = Mock(side_effect=RuntimeError("Qwen output reached the token limit"))
+        with self.assertRaisesRegex(RuntimeError, "token limit"):
+            format_json(cleaned_text="Invoice", generate=generate)
+        generate.assert_called_once()
 
     def test_ocr_returns_text_and_cleans_temporary_pages(self):
         with TemporaryDirectory() as folder:

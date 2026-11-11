@@ -177,7 +177,7 @@ class InvoiceJobService:
             return job
 
     def cleanup_delivered(self, job_id):
-        """Remove a successful job's files after its final result has been sent.
+        """Remove delivered job artifacts, retaining extracted_text.txt for inspection.
 
         Keep a process-local snapshot so existing subscribers and reconnects can
         still read the result. Delivered results no longer survive a restart.
@@ -193,7 +193,15 @@ class InvoiceJobService:
             folder = self._path(job_id).parent
             try:
                 if folder.exists():
-                    shutil.rmtree(folder)
+                    if (folder / "extracted_text.txt").is_file():
+                        for artifact in folder.iterdir():
+                            if artifact.name != "extracted_text.txt":
+                                if artifact.is_dir():
+                                    shutil.rmtree(artifact)
+                                else:
+                                    artifact.unlink()
+                    else:
+                        shutil.rmtree(folder)
             except OSError:
                 logger.exception("Could not remove delivered invoice job %s", job_id)
 
@@ -230,7 +238,10 @@ class InvoiceJobService:
                 queued_ms = (datetime.now(timezone.utc) - datetime.fromisoformat(data["created_at"])).total_seconds() * 1000
                 record_timing("queue_wait", queued_ms)
                 with pdf.open("rb") as stream:
-                    value = self.processor.process(stream, filename, progress=lambda stage: self._update(job_id, stage=stage))
+                    value = self.processor.process(
+                        stream, filename, progress=lambda stage: self._update(job_id, stage=stage),
+                        output_path=pdf.parent,
+                    )
                 with timed_stage("validating_api_result"):
                     result = InvoiceExtractionResponse.model_validate(value).model_dump(mode="json")
             except Exception:

@@ -49,7 +49,8 @@ class InvoiceProcessor:
 
     @timed_pipeline("invoice_request")
     def process(self, stream: BinaryIO, filename: str | None,
-                progress: Callable[[str], None] | None = None) -> dict[str, Any]:
+                progress: Callable[[str], None] | None = None, *,
+                output_path: Path | None = None) -> dict[str, Any]:
         self.validate_filename(filename)
         backend = os.getenv("INVOICE_TARIFF_BACKEND", "weaviate")
         if backend not in {"catalog", "weaviate"}:
@@ -67,7 +68,8 @@ class InvoiceProcessor:
             options = {"backend": backend}
             if progress is not None:
                 options["progress"] = progress
-            return doc_pipeline(pdf, Path(folder) / "output", **options)
+            destination = Path(output_path) if output_path is not None else Path(folder) / "output"
+            return doc_pipeline(pdf, destination, **options)
 
     @staticmethod
     def _validate_pdf(path: Path) -> None:

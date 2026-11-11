@@ -19,6 +19,16 @@ You must distinguish between:
 
 Never treat a SKU, Part Number, model number, UPC, EAN, GTIN, invoice number, or catalog number as an HS/HTS tariff code.
 
+COMPANY NAME AND ADDRESS PRIORITY:
+- `order_level.company_name` identifies the seller/supplier issuing this invoice. First priority is the company name printed together with that issuer's postal address in the same header, letterhead, or seller/supplier block.
+- Extract `order_level.company_address` from that same company's address block. Keep the company name and address paired; never combine names and addresses from different parties.
+- When the issuer's address block names a legal company and a separate logo or trading brand appears elsewhere, prefer the company name in the address block, preserving its printed legal suffix.
+- If no issuer name is present in an address block, use an explicitly identified seller/supplier/issuer name elsewhere on that invoice. Do not assume that the first or largest name is the issuer.
+- Buyer, Bill To, Ship To, receiver, carrier, freight forwarder, bank, and payment beneficiary names are not substitutes for the issuer. Populate shipper and receiver fields from their own labeled blocks independently.
+- If only the issuer's address is given, leave company_name null rather than inventing a name from an email/domain. If the name is known but its address is absent, leave company_address null.
+- Example: header logo "ALPHA"; seller block "Alpha Exports Ltd, 10 Market Road, London, UK"; Ship To "Beta Imports, Sydney, Australia" means company_name="Alpha Exports Ltd" and company_address="10 Market Road, London, UK".
+- Apply this priority independently to each invoice in a multi-invoice PDF.
+
 SKU RULE:
 When extracting data for `item_level`:
 - If an explicit `sku_code` is found, use it.
@@ -94,26 +104,31 @@ If the correct value cannot be determined from the available information, return
 COUNTRY ROLES — KEEP PRODUCT ORIGIN SEPARATE FROM EXPORT:
 - An invoice may name three or more countries. Do not assume there are only two countries, and do not assign roles by their order of appearance.
 - `item_level.country_of_manufacture` is the PRODUCT'S country of origin. Extract it from "Country of Origin", "Origin of Goods", "COO", "Made in", "Manufactured in", or equivalent product-origin evidence. It is not the country from which the invoice is issued, sold, shipped, or exported.
-- `order_level.origin_country` is the SHIPMENT'S departure/export country. Use explicit "Country of Export", "Exported from", "Dispatch country", or "Ship From" evidence. This field is separate from the product's country of origin even though its name contains "origin".
+- `order_level.origin_country` is the explicitly declared invoice-wide country of origin of the GOODS. Use "Country of Origin", "Origin of Goods", or "COO" evidence, never the export country. Return null when no invoice-wide origin is declared or declarations conflict; keep item-specific origins on their items.
+- `order_level.export_country` is the SHIPMENT'S departure/export country. Use explicit "Country of Export", "Exported from", "Dispatch country", or "Ship From" evidence; return null when absent. Never copy this value into `origin_country`.
 - `order_level.shipper_country` is the country in the shipper/exporter's address. A seller or shipper address alone is never evidence of where the product was manufactured.
 - `order_level.destination_country` is the goods' shipment destination. `receiver_country` belongs to the receiver's address; use the actual delivery/Ship To destination when billing and delivery addresses differ.
 - Item-level origin/manufacture evidence overrides a document-wide origin declaration for that item. Apply a document-wide "Country of Origin" declaration to all items only when it explicitly covers those goods; preserve different origins for different items.
 - Resolve each item's manufacturing country independently in this order: (1) that item's explicit origin/Made in value; (2) a declaration covering all goods as the default for items without their own value; (3) null. An item-specific exception changes only that item and does not invalidate the default for other items.
 - Example: "Country of Origin of all goods: China", item 1 without a separate origin, item 2 "Made in India" means item 1 country_of_manufacture="China" and item 2 country_of_manufacture="India". Do not clear item 1's origin because item 2 has a different origin.
-- Never fill a missing product-origin country from `origin_country`, `shipper_country`, export country, seller address, transit country, receiver country, or telephone codes. Return null when product-origin evidence is absent or conflicting and cannot be resolved.
-- Example: "Country of Origin: China; Country of Export: United Kingdom; Ship To: Australia" means `country_of_manufacture` = "China", `origin_country` = "United Kingdom", and `destination_country` = "Australia". Manufacturing-country HTS belongs to China, not the United Kingdom.
+- Never fill a missing product-origin country from `export_country`, `shipper_country`, export country, seller address, transit country, receiver country, or telephone codes. Return null when product-origin evidence is absent or conflicting and cannot be resolved.
+- Example: "Country of Origin: China; Country of Export: United Kingdom; Ship To: Australia" means `country_of_manufacture` = "China", `origin_country` = "China", `export_country` = "United Kingdom", and `destination_country` = "Australia". Manufacturing-country HTS belongs to China, not the United Kingdom.
 - Keep country roles separate for each invoice; do not copy a country from another invoice in the same PDF.
 
 FINAL COUNTRY MAPPING CHECK:
-- The printed label "Country of Origin" maps to `item_level.country_of_manufacture`, NOT directly to `order_level.origin_country`.
-- The printed label "Country of Export" maps to `order_level.origin_country`. When it is present, use that export country for this order field even if "Country of Origin" appears first or more often.
+- The printed invoice-wide label "Country of Origin" maps to `order_level.origin_country` and supplies the default `item_level.country_of_manufacture` for the goods it covers.
+- The printed label "Country of Export" maps only to `order_level.export_country`. When origin and export are separately given, preserve both countries in their own fields, regardless of label order.
 - Before returning JSON, compare these fields to their own source labels independently. Do not copy the same country into both fields unless the goods were actually manufactured and exported in that same country.
-- For the three-country example above the exact mapping is: order_level.origin_country="United Kingdom"; order_level.destination_country="Australia"; item_level[0].country_of_manufacture="China".
+- For the three-country example above the exact mapping is: order_level.origin_country="China"; order_level.export_country="United Kingdom"; order_level.destination_country="Australia"; item_level[0].country_of_manufacture="China".
 
 OUTPUT:
 All invoice data fields are optional information. Include every field with null when it is absent or unknown; never invent a value to fill a field.
 Return ONLY valid JSON matching the schema below.
 Do not add explanations, markdown, or text outside the JSON.
+JSON syntax rules:
+- Use the literal null for missing values; never leave a value blank after a colon or use None, undefined, NaN, or Infinity.
+- Numeric fields must contain a JSON number or null. Example: printed "1,234.50 GBP" becomes 1234.50. Never output currency symbols, thousands separators, units, or arithmetic expressions in numeric values.
+- Use double quotes for keys and string values, escape quotes and newlines inside strings, and do not include comments or trailing commas.
 JSON Schema:
 """ + json.dumps(INVOICE_SCHEMA)
 

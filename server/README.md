@@ -115,7 +115,7 @@ From another directory, supply the checkout path to Uvicorn:
 uvicorn --app-dir /workspace server.app:app --host 0.0.0.0 --port 8000
 ```
 
-Interactive API documentation is available at `http://localhost:8000/docs`. Importing the app does not load models or connect to the database. Qwen3-8B loads on the first full invoice request; PaddleOCR loads only for pages without usable embedded PDF text. Loaded models remain cached in that process. The default uses Qwen and mobile PaddleOCR on the first visible GPU. See [performance and memory settings](../AI/README.md#performance-and-memory-settings) for routing rules, device configuration, token limits, and stage timings. Use one worker per GPU unless memory is provisioned for multiple model copies.
+Interactive API documentation is available at `http://localhost:8000/docs`. Importing the app does not load models or connect to the database. Qwen2.5-14B-Instruct-1M loads on the first full invoice request; PaddleOCR loads only for pages without usable embedded PDF text. Loaded models remain cached in that process. The default uses Qwen and mobile PaddleOCR on the first visible GPU. See [performance and memory settings](../AI/README.md#performance-and-memory-settings) for routing rules, device configuration, token limits, and stage timings. Use one worker per GPU unless memory is provisioned for multiple model copies.
 
 Install dependencies with the same Python interpreter used to launch Uvicorn. For the existing `/workspace/server/venv` environment on the A100 host, use:
 
@@ -165,7 +165,7 @@ generation budgets. Database settings remain in `AI/config.py`. See the
 For example, set environment overrides before starting the server:
 
 ```bash
-export QWEN_MODEL_ID="Qwen/Qwen3-8B"
+export QWEN_MODEL_ID="Qwen/Qwen2.5-14B-Instruct-1M"
 export QWEN_DEVICE="cuda:0"
 export OCR_DEVICE="gpu:0"
 bash scripts/run_server.sh --host 0.0.0.0 --port 8000
@@ -196,9 +196,9 @@ No request body or PDF is required. The request waits until all three downloads 
       "location": "/workspace/.cache/huggingface/hub/models--PaddlePaddle--en_PP-OCRv5_mobile_rec/snapshots/rec-commit-hash"
     },
     {
-      "model_id": "Qwen/Qwen3-8B",
+      "model_id": "Qwen/Qwen2.5-14B-Instruct-1M",
       "revision": "qwen-commit-hash",
-      "location": "/workspace/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/qwen-commit-hash"
+      "location": "/workspace/.cache/huggingface/hub/models--Qwen--Qwen2.5-14B-Instruct-1M/snapshots/qwen-commit-hash"
     }
   ]
 }
@@ -320,7 +320,7 @@ You can also edit `INVOICE_WORKERS = 2` in `server/config.py` to choose the defa
 
 Each extraction worker lazily loads and reuses its own Qwen and PaddleOCR model copies and inference locks. This allows real inference overlap without sharing mutable predictors. GPU memory must accommodate both model copies and both active invoices' generation caches. Cold model loading is serialized; once initialized, inference runs concurrently. MuPDF parsing/rendering remains protected by a short shared lock. Keep one Uvicorn process; `--workers 2` would create separate queues and double the configured extraction workers. Explicit synchronous requests and legacy direct-upload WebSockets retain their separate shared model bundle and do not use this queue.
 
-Job metadata and final results are saved atomically under `INVOICE_JOB_DIR`, which defaults to `/workspace/output/invoice_jobs`. The uploaded PDF is deleted when processing finishes. After a successful final result is sent by HTTP polling, WebSocket, or Socket.IO, that job's entire directory is deleted. The initial `202` and progress messages do not trigger deletion. Failed jobs and successful results that have not been sent remain on disk. Cleanup never removes another job's directory.
+Job metadata and final results are saved atomically under `INVOICE_JOB_DIR`, which defaults to `/workspace/output/invoice_jobs`. The uploaded PDF is deleted when processing finishes. Queued jobs save `extracted_text.txt` directly under `INVOICE_JOB_DIR/<job_id>/` after text extraction. This UTF-8 file contains only extracted text and remains available even if a later processing stage fails. After a successful final result is sent by HTTP polling, WebSocket, or Socket.IO, other artifacts and job metadata are deleted; `extracted_text.txt` is retained until manually removed. The initial `202` and progress messages do not trigger deletion. Failed jobs and successful results that have not been sent remain on disk. Cleanup never removes another job's directory.
 
 Delivered results remain in process memory for polling and reconnects until the API restarts; they no longer survive a restart. Clients should save the final JSON they receive. Synchronous extraction and direct upload WebSockets already remove their temporary PDFs and pipeline artifacts when processing exits.
 
@@ -384,7 +384,7 @@ Each connection handles one PDF:
 4. Receive `{"event":"processing"}` followed by progress messages such as `{"event":"progress","stage":"running_ocr"}` and `{"event":"progress","stage":"extracting_json"}`.
 5. Receive `{"event":"completed","result":{"invoices":[...]}}`. The `result` object has the same schema as the HTTP response. The server then closes normally with WebSocket code `1000`.
 
-Pipeline stages include `loading_models`, `extracting_pdf_text`, `loading_ocr_model` and `running_ocr` when needed, `cleaning_text`, `extracting_json`, `identifying_products`, `identifying_product`, `loading_tariff_index`, `retrieving_tariffs`, `classifying_items`, and `completed`. Native-only PDFs skip the OCR stages. Existing routes, event envelopes, output filenames, and invoice response fields are preserved. New stage names are additional progress values; clients should display their descriptions rather than requiring a fixed list. A `loading_models` progress message also occurs when the loader returns cached models; it does not mean model weights are reloaded. Processing runs in a worker thread while progress messages are sent on the event loop. The upload is spooled to disk above 1 MiB rather than keeping a complete large PDF in memory.
+Pipeline stages include `loading_models`, `extracting_pdf_text`, `loading_ocr_model` and `running_ocr` when needed, `extracting_json`, `identifying_products`, `identifying_product`, `loading_tariff_index`, `retrieving_tariffs`, `classifying_items`, and `completed`. Native-only PDFs skip the OCR stages. Existing routes, event envelopes, output filenames, and invoice response fields are preserved. New stage names are additional progress values; clients should display their descriptions rather than requiring a fixed list. A `loading_models` progress message also occurs when the loader returns cached models; it does not mean model weights are reloaded. Processing runs in a worker thread while progress messages are sent on the event loop. The upload is spooled to disk above 1 MiB rather than keeping a complete large PDF in memory.
 
 Python client example (install the client with `python -m pip install "websockets>=12"`):
 
@@ -431,7 +431,7 @@ sequenceDiagram
     API->>Service: Uploaded file stream
     Service->>Service: Limit size, save isolated PDF, validate pages
     Service->>AI: PDF path and temporary output directory
-    AI->>AI: Load cached models, OCR, clean, extract and validate JSON
+    AI->>AI: Load cached models, OCR, extract and validate JSON
     AI->>DB: Country filtered tariff candidate queries
     DB-->>AI: Candidates
     AI->>AI: Select and validate classifications

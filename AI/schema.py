@@ -8,7 +8,7 @@ ORDER_FIELDS = (
     "receiver_zipcode receiver_address1 receiver_address2 receiver_email gross_weight "
     "net_weight package_count total_quantity total_amount shipping_and_handling "
     "total_item_value dimensions_cm origin_phone_code destination_phone_code "
-    "origin_country destination_country"
+    "origin_country destination_country export_country"
 ).split()
 ORDER_NUMBER_FIELDS = (
     "gross_weight net_weight package_count total_quantity total_amount "
@@ -32,8 +32,13 @@ def object_schema(properties):
 STRING = {"type": ["string", "null"]}
 NUMBER = {"type": ["number", "null"]}
 INTEGER = {"type": ["integer", "null"]}
+COMPANY_DESCRIPTIONS = {
+    "company_name": "Invoice issuer/seller name. First priority: the name printed with the issuer's postal address in the same block, ahead of a separate logo/brand. Never substitute buyer, receiver, carrier, or bank names. Null if unknown.",
+    "company_address": "Postal address paired with the selected invoice issuer/seller company_name, from that same company's block. Never use another party's address. Null if absent.",
+}
 COUNTRY_DESCRIPTIONS = {
-    "origin_country": "Shipment departure/export country, not the product's country of origin or manufacture.",
+    "origin_country": "Explicit invoice-wide Country of Origin of the goods; never substitute the export or shipper country. Null if absent or conflicting.",
+    "export_country": "Shipment departure/export country from Country of Export, Exported from, Dispatch country, or Ship From; separate from goods origin.",
     "shipper_country": "Country in the shipper/exporter's address; not proof of product origin.",
     "destination_country": "Actual goods delivery/Ship To country, separate from product origin and export country.",
     "receiver_country": "Country in the receiver's address.",
@@ -60,7 +65,7 @@ INVOICE_SCHEMA = object_schema({
 _invoice_properties = INVOICE_SCHEMA["properties"]["invoices"]["items"]["properties"]
 for _group in (_invoice_properties["order_level"]["properties"],
                _invoice_properties["item_level"]["items"]["properties"]):
-    for _field, _description in COUNTRY_DESCRIPTIONS.items():
+    for _field, _description in {**COMPANY_DESCRIPTIONS, **COUNTRY_DESCRIPTIONS}.items():
         if _field in _group:
             _group[_field] = {**_group[_field], "description": _description}
 

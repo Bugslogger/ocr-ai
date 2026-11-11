@@ -10,7 +10,7 @@ The `AI` package converts a PDF into structured invoice JSON, retrieves tariff c
 flowchart TD
     A[Input PDF] --> T[Extract and check native text per page]
     T --> U{Usable text with no large images}
-    U -->|Yes| D[Combine ordered page text and clean markup]
+    U -->|Yes| D[Combine ordered page text]
     U -->|No| B[Render only pages needing OCR]
     B --> C[PP-OCRv5 mobile detection and English recognition]
     C --> D
@@ -29,7 +29,8 @@ flowchart TD
 ```
 
 1. **Extract text first, then OCR.** PyMuPDF reads native PDF words and groups them by bounding boxes. A page uses native text when it has at least 40 non-whitespace characters, four words, sufficient alphanumeric content, no replacement/control characters, no extraction warnings, and less than 10% image area. Otherwise the whole page falls back to OCR so a native header cannot hide a scanned invoice body. This is a conservative heuristic; it cannot prove the text layer matches the visible invoice. Only fallback pages are rendered at `OCR_DPI` (default 250), and Paddle models are loaded only if a page needs OCR. PaddleOCR uses exactly `PP-OCRv5_mobile_det` for detection and `en_PP-OCRv5_mobile_rec` for English recognition. Document orientation, unwarping, and text-line orientation models are disabled. Bounding boxes are grouped into rows, with cells ordered left to right and separated by tabs. Pages retain PDF order with `<PAGE>` separators in `detailed_invoice_output.txt`. Empty pages and malformed results fail explicitly to avoid returning partial invoices. Temporary page images are removed on success and failure. This is geometric text ordering, not table structure recognition; rotated text and complex merged tables need accuracy checks.
-2. **Clean.** Detection coordinates and markup are removed, preserving table cell boundaries and page breaks. The result is written to `plain_invoice_text.txt`. Empty OCR output stops the run.
+   Extraction also saves `extracted_text.txt` in the output directory: only the extracted text, with blank lines between pages, without HTML escaping or `<PAGE>` markers. This file is available before JSON extraction or tariff classification runs.
+2. **Use extracted text directly.** Qwen receives `extracted_text.txt` unchanged. There is no markup stripping, entity decoding, or whitespace cleanup step. Empty extracted text stops the run.
 3. **Extract.** Qwen receives the text and the shared JSON Schema. It extracts invoice, shipment, and line-item fields without inferring tariff codes. Missing values are null. Manufacturing country must come from product evidence; it is not copied from the sender's address.
 4. **Validate extraction.** Missing invoice data fields are filled with null before validation, including fields in omitted order and shipment objects. Malformed JSON, unexpected fields, incorrect supplied field types, empty invoice lists, and empty item lists stop the run. Valid extraction is saved before classification modifies it.
 5. **Retrieve missing codes.** Country-specific codes explicitly printed on the invoice take precedence. Items with both structurally valid national codes skip retrieval and classification; if every item is complete, the tariff backend is never opened or downloaded. For incomplete items, Weaviate queries only countries whose codes are missing or malformed. Records use `(invoice_index, item_index)`, so SKU collisions cannot overwrite another item's results. Country lookup uses exact names, ISO codes, and explicit aliases.
@@ -43,7 +44,7 @@ flowchart TD
 | `main.py` | Full pipeline, progress events, CLI, and connection cleanup |
 | `model.py` | Lazy model loading and process-local model reuse |
 | `ocr.py` | PaddleOCR bounding-box validation and text row/column ordering |
-| `utils.py` | PDF rendering, OCR, text cleaning, Qwen generation, extraction, and output writing |
+| `utils.py` | PDF rendering, OCR, Qwen generation, extraction, and output writing |
 | `schema.py` | Shared extraction contract and JSON Schema validation |
 | `prompt.py` | Extraction instructions generated around that contract |
 | `tariff.py` | Country resolution, retrieval backends, candidate validation, and classification |
@@ -77,7 +78,7 @@ For the API server, also install `server/requirements.txt`. Keep the full pipeli
 
 The AI requirements require PyTorch 2.10 or later and pin Transformers 4.57.1. The server requirements contain only API dependencies so both files can be installed in one environment without conflicting model-library pins. On a CUDA 12.8 host, install PyTorch first with `python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128`. Torchvision and torchaudio are not required by this text-only Qwen/PaddleOCR flow. Use the same interpreter for installation and server startup.
 
-Model repositories are `PaddlePaddle/PP-OCRv5_mobile_det`, `PaddlePaddle/en_PP-OCRv5_mobile_rec`, and `Qwen/Qwen3-8B`. Qwen supports optional NF4 4-bit double quantization (`load_in_4bit` is currently `False` in `QWEN_QUANTIZATION_CONFIG`), BF16 compute by default (`QWEN_COMPUTE_DTYPE=auto` enables BF16/FP16 capability selection), SDPA attention, and one selected GPU without automatic CPU/disk offload. Thinking is disabled via the chat template for structured JSON generation. All use the shared Hugging Face cache and support `HF_TOKEN`. Override repositories with `OCR_DET_MODEL_ID`, `OCR_REC_MODEL_ID`, and `QWEN_MODEL_ID`; pin revisions with the corresponding `*_MODEL_REVISION` variables. The OCR loader supplies the downloaded local model directories to PaddleOCR.
+Model repositories are `PaddlePaddle/PP-OCRv5_mobile_det`, `PaddlePaddle/en_PP-OCRv5_mobile_rec`, and `Qwen/Qwen2.5-14B-Instruct-1M`. Qwen supports optional NF4 4-bit double quantization (`load_in_4bit` is currently `False` in `QWEN_QUANTIZATION_CONFIG`), BF16 compute by default (`QWEN_COMPUTE_DTYPE=auto` enables BF16/FP16 capability selection), SDPA attention, and one selected GPU without automatic CPU/disk offload. All use the shared Hugging Face cache and support `HF_TOKEN`. Override repositories with `OCR_DET_MODEL_ID`, `OCR_REC_MODEL_ID`, and `QWEN_MODEL_ID`; pin revisions with the corresponding `*_MODEL_REVISION` variables. The OCR loader supplies the downloaded local model directories to PaddleOCR.
 
 OCR settings: `OCR_DEVICE=gpu:0` (default), `OCR_DPI=250`, and `OCR_RECOGNITION_BATCH_SIZE=32`. Install the GPU framework in the same environment as the API. Do not install both Paddle engine packages together:
 
@@ -172,7 +173,7 @@ which model bundles are loaded across extraction workers in that API process.
 ## Performance and memory settings
 
 
-The default configuration places PaddleOCR on `gpu:0` and Qwen3-8B on `cuda:0`, sharing the first visible GPU.
+The default configuration places PaddleOCR on `gpu:0` and Qwen2.5-14B-Instruct-1M on `cuda:0`, sharing the first visible GPU.
 Background extraction uses `INVOICE_WORKERS=2` by default, with independent model copies and concurrent KV caches. GPU memory must accommodate both. Set `INVOICE_WORKERS=1` for serial processing. Use one Uvicorn process so all queued invoices share the same worker limit. Native-only PDFs do not render images or load PaddleOCR.
 `download_models(include_ocr=False)` loads only Qwen; the default helper call
 still explicitly loads both OCR and Qwen for callers that want to preload them.
@@ -194,7 +195,7 @@ quota. Lower it for tighter memory budgets, keeping it larger than the prompt
 plus the output ceiling. Large invoices can require more memory and generation
 work. Do not increase worker count to accelerate one invoice: each worker loads
 another model copy. Model/revision overrides take precedence over defaults;
-remove an old `QWEN_MODEL_ID` override when switching to Qwen3-8B. Restart the API
+remove an old `QWEN_MODEL_ID` override when switching to Qwen2.5-14B-Instruct-1M. Restart the API
 to replace models already cached in memory.
 
 Every processing stage emits a `performance` JSON log with `run_id`, `stage`,
@@ -311,16 +312,16 @@ Every output directory contains these files after a successful run:
 | File | Contents |
 | --- | --- |
 | `detailed_invoice_output.txt` | Raw model-returned OCR |
-| `plain_invoice_text.txt` | Cleaned text supplied to Qwen |
+| `extracted_text.txt` | Extracted text supplied unchanged to Qwen |
 | `extracted_invoice.json` | Schema-validated extraction before classification |
 | `db_matches.json` | Retrieved candidates, countries, source, and positional item identity |
 | `final_classification.json` | All invoices with classification results and review flags |
 
 Extraction has three groups per invoice: `order_level`, `item_level`, and `shipment`. The exact fields and nullable types are defined in `schema.py`. Quantity is numeric and may be fractional. Monetary values remain in the invoice's stated currency.
 
-`order_level` includes company and invoice details; separate shipper and receiver contact/address fields (including email, phone, state, and both address lines); gross/net weights; package count; total quantity, amount, item value, and shipping/handling; dimensions in cm; origin/destination phone codes; and shipment origin/destination countries. All 42 data fields are optional during extraction; omitted fields are returned as null in the normalized output. Weights, quantities, and amounts are numbers; `package_count` is an integer. Phone numbers/calling codes, postal codes, and `dimensions_cm` remain strings. Shipment origin is separate from each item's country of manufacture.
+`order_level` includes company and invoice details; separate shipper and receiver contact/address fields (including email, phone, state, and both address lines); gross/net weights; package count; total quantity, amount, item value, and shipping/handling; dimensions in cm; origin/destination phone codes; and goods origin, shipment export, and destination countries. All 43 data fields are optional during extraction; omitted fields are returned as null in the normalized output. Weights, quantities, and amounts are numbers; `package_count` is an integer. Phone numbers/calling codes, postal codes, and `dimensions_cm` remain strings. An invoice-wide origin declaration is separate from item-specific manufacturing origins and the shipment export country.
 
-Invoices may name three or more countries. `item_level.country_of_manufacture` represents product origin (Country of Origin/COO/Made in), while `order_level.origin_country` represents shipment departure/export. For goods made in China, exported from the UK, and delivered to Australia, these fields are China, United Kingdom, and Australia (`destination_country`) respectively. Origin national tariff retrieval uses China. Item-specific manufacturing evidence takes precedence over a declaration covering all goods, so different items may have different manufacturing countries. When product-origin evidence is absent, it stays null; the exporter or shipper country is not substituted.
+Invoices may name three or more countries. `item_level.country_of_manufacture` represents product origin (Country of Origin/COO/Made in), while `order_level.origin_country` holds the explicit invoice-wide goods origin declaration and `order_level.export_country` holds shipment departure/export. For an invoice declaring origin China, export UK, and delivery Australia, `origin_country` and `country_of_manufacture` are China, `export_country` is United Kingdom, and `destination_country` is Australia. An absent or conflicting invoice-wide origin stays null; item-specific origins remain on the items. Origin national tariff retrieval uses China. Item-specific manufacturing evidence takes precedence over a declaration covering all goods, so different items may have different manufacturing countries. When product-origin evidence is absent, it stays null; the exporter or shipper country is not substituted.
 
 Classification adds:
 
@@ -354,7 +355,7 @@ The WebSocket endpoint `/ws/invoices/extract` accepts JSON filename/size metadat
 
 Call `POST /api/v1/models/download` without a body to download and store all three model repositories before processing invoices. It returns cache snapshot paths and revisions without importing Torch or loading model objects. The inference loaders use the same cache directory. `GET /api/v1/models/status` checks cached weights, including all shards in a weight index.
 
-The existing path-based `/api/v1/jobs` endpoints remain OCR-only. Their processor imports `AI.model` and `AI.utils`, loads only OCR, and returns raw and cleaned text paths. Their REST/WebSocket contract is unchanged. See [`server/README.md`](../server/README.md) for upload examples, API flow, configuration, error codes, and startup commands.
+The existing path-based `/api/v1/jobs` endpoints remain OCR-only. Their processor imports `AI.model` and `AI.utils`, loads only OCR, and returns raw and extracted text paths. Their REST/WebSocket contract is unchanged. See [`server/README.md`](../server/README.md) for upload examples, API flow, configuration, error codes, and startup commands.
 
 ## Verification and limits
 

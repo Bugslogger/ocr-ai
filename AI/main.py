@@ -6,7 +6,7 @@ import os
 
 from .model import download_ocr, download_qwen, pipeline_lock
 from .tariff import CatalogRetriever, WeaviateRetriever, needs_tariff_lookup
-from .utils import (extract_doc, clean_extracted_text, format_json, make_generator,
+from .utils import (extract_doc, format_json, make_generator,
                     fetch_hts, update_invoice, save_json)
 from .performance import timed_pipeline, timed_stage, timed_lock
 
@@ -37,10 +37,9 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
             if generate is None:
                 generate = make_generator(**models["qwen"])
             extract_doc(pdf, destination, models.get("ocr"), progress=report)
-            report("cleaning_text")
-            cleaned = clean_extracted_text(destination)
+            extracted = (destination / "extracted_text.txt").read_text(encoding="utf-8")
             report("extracting_json")
-            parsed = format_json(cleaned_text=cleaned, output_path=destination, generate=generate)
+            parsed = format_json(cleaned_text=extracted, output_path=destination, generate=generate)
             missing_codes = any(needs_tariff_lookup(item, inv["order_level"]) for inv in parsed["invoices"] for item in inv["item_level"])
             if missing_codes:
                 report("identifying_products")

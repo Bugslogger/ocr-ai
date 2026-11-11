@@ -99,6 +99,7 @@ def extract_doc(doc_path, output_path, model=None, *, progress=None, force_ocr=F
     from html import escape
     raw = "\n<PAGE>\n".join(escape(page, quote=False) for page in pages)
     with timed_stage("saving_document_text"):
+        (destination / "extracted_text.txt").write_text("\n\n".join(pages), encoding="utf-8")
         (destination / "detailed_invoice_output.txt").write_text(raw, encoding="utf-8")
     return raw
 
@@ -157,6 +158,10 @@ def qwen_generate(messages, Qtokenizer, Qmodel, max_new_tokens=None, temperature
                    eos_token_id=Qtokenizer.eos_token_id, pad_token_id=Qtokenizer.eos_token_id)
     if temperature > 0:
         options["temperature"] = temperature
+    else:
+        # Override sampling defaults inherited from the model's generation_config.
+        # Omitting them leaves Qwen's sampling settings active in greedy mode.
+        options.update(temperature=None, top_p=None, top_k=None)
     with torch.inference_mode(), timed_stage("qwen_decode", input_tokens=input_length,
                                               max_new_tokens=max_new_tokens) as metrics:
         generated = Qmodel.generate(**inputs, **options)[0][input_length:]
@@ -198,14 +203,49 @@ def format_json(Qtokenizer=None, Qmodel=None, system_prompt=None, *, cleaned_tex
     from .schema import validate_invoice
 
     if not cleaned_text.strip():
-        raise ValueError("Cleaned OCR text is empty")
+        raise ValueError("Extracted text is empty")
     generate = generate or make_generator(Qtokenizer, Qmodel)
-    response = generate([
+    messages = [
         {"role": "system", "content": system_prompt or EXTRACT_SYSTEM_PROMPT},
         {"role": "user", "content": "OCR Text:\n\n" + cleaned_text},
-    ], **Qconfig)
-    with timed_stage("validating_invoice_json"):
-        parsed = validate_invoice(parse_json_maybe(response))
+    ]
+    for attempt in range(2):
+        response = generate(messages, **Qconfig)
+        try:
+            with timed_stage("validating_invoice_json"):
+                parsed = validate_invoice(parse_json_maybe(response))
+        except json.JSONDecodeError as error:
+            if output_path:
+                destination = Path(output_path)
+                destination.mkdir(parents=True, exist_ok=True)
+                (destination / f"invalid_invoice_response_{attempt + 1}.txt").write_text(
+                    response, encoding="utf-8"
+                )
+            if attempt:
+                raise ValueError(
+                    "Invoice model returned invalid JSON after 2 attempts: "
+                    f"{error.msg} at line {error.lineno}, column {error.colno}"
+                ) from error
+            logger.warning(
+                "Invoice model returned invalid JSON (%s at line %d, column %d); retrying once",
+                error.msg, error.lineno, error.colno,
+            )
+            # Regenerate from the source rather than guessing invoice values or
+            # adding the entire broken response to the model's context window.
+            messages = [messages[0], {
+                "role": "user",
+                "content": messages[1]["content"] + (
+                    "\n\nYour previous response was invalid JSON: "
+                    f"{error.msg} at line {error.lineno}, column {error.colno}. "
+                    "Extract the complete invoice again from the source above. "
+                    "Return one complete JSON object, with every line item. "
+                    "Use null for unknown values, double-quoted strings, and literal numbers "
+                    "without currency symbols, thousands separators, or arithmetic expressions. "
+                    "Do not include comments, trailing commas, or markdown."
+                ),
+            }]
+        else:
+            break
     # Explicit invoice codes are retained as evidence, never silently cleared.
     if output_path:
         save_json(Path(output_path) / "extracted_invoice.json", parsed)

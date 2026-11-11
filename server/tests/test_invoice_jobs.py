@@ -134,6 +134,34 @@ class InvoiceJobTests(TestCase):
         with self.assertRaises(FileNotFoundError):
             InvoiceJobService(root=self.directory.name).get(first)
 
+    def test_extracted_text_survives_result_delivery_and_later_pipeline_failure(self):
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                def pipeline(document, output, **options):
+                    (output / "extracted_text.txt").write_text("Invoice £100\nSecond page", encoding="utf-8")
+                    (output / "intermediate.json").write_text("{}")
+                    if fail:
+                        raise RuntimeError("JSON extraction failed")
+                    return extracted_result()
+
+                with patch("AI.main.doc_pipeline", side_effect=pipeline):
+                    if fail:
+                        with self.assertLogs("server.services.invoice_jobs", level="ERROR"):
+                            job_id = self.submit().json()["job_id"]
+                            final = self.terminal(job_id)
+                    else:
+                        job_id = self.submit().json()["job_id"]
+                        final = self.terminal(job_id)
+                self.assertEqual(final.status, JobStatus.FAILED if fail else JobStatus.SUCCEEDED)
+                response = self.client.get(f"/api/v1/invoices/jobs/{job_id}")
+                self.assertEqual(response.status_code, 200)
+                folder = Path(self.directory.name) / job_id
+                self.assertEqual((folder / "extracted_text.txt").read_text(encoding="utf-8"),
+                                 "Invoice £100\nSecond page")
+                self.assertFalse((folder / "invoice.pdf").exists())
+                if not fail:
+                    self.assertEqual([p.name for p in folder.iterdir()], ["extracted_text.txt"])
+
     def test_cleanup_keeps_processing_and_failed_jobs(self):
         started, release = Event(), Event()
 
@@ -330,8 +358,10 @@ class InvoiceJobTests(TestCase):
                 self.assertEqual(self.service.get(job_id).status, JobStatus.SUCCEEDED)
 
     def test_worker_configuration(self):
+        from server.config import INVOICE_WORKERS
+
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(InvoiceJobService(root=self.directory.name).worker_count, 2)
+            self.assertEqual(InvoiceJobService(root=self.directory.name).worker_count, INVOICE_WORKERS)
             with patch("server.config.INVOICE_WORKERS", 4):
                 self.assertEqual(InvoiceJobService(root=self.directory.name).worker_count, 4)
         with patch.dict(os.environ, {"INVOICE_WORKERS": "3"}):
