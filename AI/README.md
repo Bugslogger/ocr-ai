@@ -2,7 +2,7 @@
 
 The `AI` package converts a PDF into structured invoice JSON, retrieves tariff candidates, and asks Qwen to select from those candidates. The same implementation runs from the command line, Python, and both notebooks. All invoices and their line items are processed, including items with duplicate or missing SKUs.
 
-`hs6_code` contains the inferred international six-digit code. National codes require country-specific candidates. When those candidates or sufficient product details are unavailable, national fields remain null and `needs_review` is true. Codes explicitly printed on an invoice are retained as evidence and always flagged for review.
+`hs6_code` contains the inferred international six-digit code. Full national codes require country-specific candidates. When a national extension is unavailable, the manufacturing/destination HTS fields contain the supported international HS6, or a printed four-digit heading if no HS6 is established. Their source is marked `hs6_fallback` or `hs4_fallback`, and `needs_review` is true. They remain null only when no supported international or national code is available. Codes explicitly printed on an invoice are retained as evidence and always flagged for review.
 
 ## Processing flow
 
@@ -339,7 +339,7 @@ The invoice pipeline uses `CatalogWeaviateRetriever`: the local HS catalog selec
 1. Load `/root/ocr-ai/harmonized-system.csv` (the repository-root CSV) lazily on first use and reuse the in-memory index across invoices and workers. Override with `HS_CATALOG_PATH` or the CLI `--catalog` argument. A missing or invalid local catalog fails explicitly; this Weaviate flow does not silently download a different edition. Ensure the CSV is included when deploying the project.
 2. Rank catalog HS6 candidates from the identified product description and parent context. Existing invoice tariff evidence constrains the permissible prefix. Qwen selects only a catalog candidate; a four-digit printed heading constrains the six-digit selection without inventing suffixes. Invalid or unavailable selections produce a reviewable item and do not trigger country queries.
 3. Query `Hs_category` using the database country ID and the selected six-digit prefix, including compact and common dotted code representations. This path does not run a broad BM25 product search. Country-scoped results are paginated in batches of at least 100; there is no silent first-page-only truncation. Returned codes are rechecked for the selected HS6, active/deleted status and leaf status, and deduplicated. New Zealand check letters are preserved.
-4. Use product details and the selected catalog description/parent to choose national extensions. Each selection must belong to that country's retrieved candidates and extend the locked HS6. The national model cannot replace the international selection with an unrelated code. If no national rows exist or a national selection fails validation, keep the catalog-selected `hs6_code`, leave unavailable national fields null and flag review. Uncertainty from HS6 selection carries into the final result.
+4. Use product details and the selected catalog description/parent to choose national extensions. Each selection must belong to that country's retrieved candidates and extend the locked HS6. The national model cannot replace the international selection with an unrelated code. If no national rows exist or a national selection fails validation, keep the catalog-selected `hs6_code`, populate unavailable national-code fields with that international HS6, mark their source `hs6_fallback` and flag review. Uncertainty from HS6 selection carries into the final result.
 
 Origin uses the item's manufacturing country; export and shipper countries are not substitutes. Destination uses `destination_country`, falling back to `receiver_country`. Unknown or unmapped countries are skipped, identical origin/destination countries share a query, and roles with valid printed national codes skip their lookup. Items already containing both valid national codes retain the existing lookup/classification bypass. The invoice extraction schema and receiver/country rules are unchanged.
 
@@ -396,9 +396,10 @@ Classification adds:
 | --- | --- |
 | `hs6_code` | Selected international HS6, or null |
 | `hs_code` | Four-digit heading when the invoice supplies only four digits; otherwise the first six digits of a valid numeric invoice code, or the inferred HS6. Original printed codes remain in `invoice_tariff_codes` |
-| `manufacturing_country_hts_code` | Full national code explicitly extracted for the manufacturing country takes precedence; if missing or malformed, use the validated origin-country candidate, otherwise null |
-| `manufacturing_country_hts_source` | `invoice`, the retrieval source, or null when no origin national code is available |
-| `destination_country_hts_code` | Destination national candidate, or retained invoice value |
+| `manufacturing_country_hts_code` | Printed national code first, then validated origin-country candidate, then supported HS6/printed HS4 fallback; null only without a supported code |
+| `manufacturing_country_hts_source` | `invoice`, retrieval source, `hs6_fallback`, `hs4_fallback`, or null without a supported code |
+| `destination_country_hts_code` | Printed national code first, then validated destination candidate, then supported HS6/printed HS4 fallback |
+| `destination_country_hts_source` | `invoice`, retrieval source, `hs6_fallback`, `hs4_fallback`, or null without a supported code |
 | `destination_tariff_code` | Alias of the final destination national field |
 | `invoice_tariff_codes` | Original explicitly extracted code values, when present |
 | `candidate_hs` | Retrieved international candidate codes |
@@ -409,6 +410,8 @@ Classification adds:
 | `classification_reason` | Model explanation or failure reason |
 
 National candidates passed to the selecting model are filtered to the allowed HS6 set. A rejected HS6 selection receives LOW confidence and an explicit rejection reason; its original model explanation is not presented as a successful classification.
+
+National database titles such as Other or Others are valid candidates and are interpreted using HS6, parent descriptions and product details. The model is instructed to choose the most supported retrieved candidate rather than reject a generic title. Candidate membership and country/HS6 prefix checks remain mandatory. If no national choice is supported, international fallback is used rather than inventing a national suffix or selecting an unrelated row.
 
 Review flags take priority over confidence. A result requiring review cannot retain HIGH confidence. Invoice-supplied codes may conflict with inferred codes; the original values are preserved as evidence, and the row remains reviewable. A sender's country is not used as a substitute for country of manufacture.
 

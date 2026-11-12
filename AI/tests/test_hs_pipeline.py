@@ -122,8 +122,8 @@ class HSPipelineTests(TestCase):
         matches = retriever.retrieve(ITEM, ORDER)
         result = classify_item(ITEM, ORDER, matches, generate)
         self.assertEqual(result["hs6_code"], "321519")
-        self.assertIsNone(result["manufacturing_country_hts_code"])
-        self.assertIsNone(result["destination_country_hts_code"])
+        self.assertEqual(result["manufacturing_country_hts_code"], "321519")
+        self.assertEqual(result["destination_country_hts_code"], "321519")
         self.assertTrue(result["needs_review"])
         generate.assert_called_once()
 
@@ -189,7 +189,7 @@ class HSPipelineTests(TestCase):
                                            "destination_national_code": None, "confidence": "HIGH", "needs_review": False})
         result = classify_item(ITEM, ORDER, matches, generate)
         self.assertEqual(result["hs6_code"], "321519")
-        self.assertIsNone(result["manufacturing_country_hts_code"])
+        self.assertEqual(result["manufacturing_country_hts_code"], "321519")
         self.assertTrue(result["needs_review"])
 
     def test_national_model_selects_only_extensions_of_locked_hs6(self):

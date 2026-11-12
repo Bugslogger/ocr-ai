@@ -267,7 +267,7 @@ class TariffTests(TestCase):
         result = classify_item(inv["item_level"][0], inv["order_level"], matches, generate)
         self.assertEqual(result["hs_code"], "854442")
         self.assertEqual(result["hs6_code"], "854442")
-        self.assertIsNone(result["destination_country_hts_code"])
+        self.assertEqual(result["destination_country_hts_code"], "854442")
         self.assertTrue(result["needs_review"])
         self.assertEqual(result["confidence"], "MEDIUM")
 
@@ -339,7 +339,7 @@ class TariffTests(TestCase):
                 self.assertEqual(result["manufacturing_country_hts_code"], "8544.42.00.00")
                 self.assertEqual(result["manufacturing_country_hts_source"], matches["source"])
 
-    def test_invalid_origin_evidence_and_rejected_candidate_leave_null(self):
+    def test_invalid_origin_evidence_and_rejected_candidate_use_validated_hs6(self):
         inv = invoice()
         item = inv["item_level"][0]
         item["manufacturing_country_hts_code"] = "UNITED KINGDOM"
@@ -347,8 +347,8 @@ class TariffTests(TestCase):
         response = json.dumps({"hs6": "854442", "origin_national_code": "7616999001",
                                "needs_review": False, "confidence": "MEDIUM"})
         result = classify_item(item, inv["order_level"], matches, Mock(return_value=response))
-        self.assertIsNone(result["manufacturing_country_hts_code"])
-        self.assertIsNone(result["manufacturing_country_hts_source"])
+        self.assertEqual(result["manufacturing_country_hts_code"], "854442")
+        self.assertEqual(result["manufacturing_country_hts_source"], "hs6_fallback")
         self.assertTrue(result["needs_review"])
 
     def test_invoice_hs_prevents_unrelated_origin_fallback(self):
@@ -362,7 +362,8 @@ class TariffTests(TestCase):
         generate.assert_not_called()
         self.assertEqual(result["hs_code"], "870829")
         self.assertIsNone(result["hs6_code"])
-        self.assertIsNone(result["manufacturing_country_hts_code"])
+        self.assertEqual(result["manufacturing_country_hts_code"], "870829")
+        self.assertEqual(result["manufacturing_country_hts_source"], "hs6_fallback")
         self.assertIn("No retrieved HS6 matches", result["validation_note"])
 
     def test_same_country_retrieved_for_both_roles(self):
