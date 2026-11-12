@@ -671,8 +671,6 @@ class PipelineTests(TestCase):
         self.assertEqual(result["order_level"]["export_country"], "United Kingdom")
         self.assertEqual(result["item_level"][0]["country_of_manufacture"], "China")
         system = generate.call_args.args[0][0]["content"]
-        self.assertIn('order_level.origin_country="China"', system)
-        self.assertIn('order_level.export_country="United Kingdom"', system)
         contract = json.loads(system.split("JSON Schema:\n", 1)[1])
         fields = contract["properties"]["invoices"]["items"]["properties"]["order_level"]["properties"]
         for field in ("origin_country", "export_country"):

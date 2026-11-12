@@ -224,17 +224,43 @@ def save_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
 
 
+def apply_shipper_country_policy(invoice_data):
+    """With declared goods origin, expose only an agreeing shipper country or null.
+
+    No country is copied to another role. Address-only and item-origin-only
+    invoices retain their extracted shipper address country.
+    """
+    from .tariff import iso2_from_country
+
+    for invoice in invoice_data["invoices"]:
+        order = invoice["order_level"]
+        origin, shipper = order.get("origin_country"), order.get("shipper_country")
+        if not origin or not shipper:
+            continue
+        if origin.strip().casefold() == shipper.strip().casefold():
+            continue
+        origin_iso, shipper_iso = iso2_from_country(origin), iso2_from_country(shipper)
+        if not origin_iso or origin_iso != shipper_iso:
+            order["shipper_country"] = None
+    return invoice_data
+
+
 @timed_pipeline("extracting_json")
 def format_json(Qtokenizer=None, Qmodel=None, system_prompt=None, *, cleaned_text,
                 output_path=None, generate=None, layout_text=None):
     from .model_config import Qconfig, EXTRACTION_CONFIG
     from .prompt import EXTRACT_SYSTEM_PROMPT, LAYOUT_INPUT_PROMPT
     from .schema import validate_invoice
+    from .layout_input import compact_layout_text
 
     if not cleaned_text.strip():
         raise ValueError("Extracted text is empty")
     generate = generate or make_generator(Qtokenizer, Qmodel)
     use_layout = EXTRACTION_CONFIG["layout_aware"] and bool(layout_text)
+    if use_layout:
+        with timed_stage("preparing_layout_input", original_characters=len(layout_text)) as metrics:
+            layout_text = compact_layout_text(layout_text)
+            metrics["model_characters"] = len(layout_text)
     messages = [
         {"role": "system", "content": (system_prompt or EXTRACT_SYSTEM_PROMPT)
          + ("\n\n" + LAYOUT_INPUT_PROMPT if use_layout else "")},
@@ -245,7 +271,7 @@ def format_json(Qtokenizer=None, Qmodel=None, system_prompt=None, *, cleaned_tex
         response = generate(messages, **Qconfig)
         try:
             with timed_stage("validating_invoice_json"):
-                parsed = validate_invoice(parse_json_maybe(response))
+                parsed = apply_shipper_country_policy(validate_invoice(parse_json_maybe(response)))
         except json.JSONDecodeError as error:
             if output_path:
                 destination = Path(output_path)

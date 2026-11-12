@@ -37,14 +37,15 @@ COMPANY_DESCRIPTIONS = {
     "company_address": "Postal address paired with the selected invoice issuer/seller company_name, from that same company's block. Never use another party's address. Null if absent.",
 }
 COUNTRY_DESCRIPTIONS = {
-    "origin_country": "Explicit invoice-wide Country of Origin of the goods; never substitute the export or shipper country. Null if absent or conflicting.",
-    "export_country": "Shipment departure/export country from Country of Export, Exported from, Dispatch country, or Ship From; separate from goods origin.",
-    "shipper_country": "Country in the shipper/exporter's address; not proof of product origin.",
+    "origin_country": "Explicit invoice-wide goods origin/manufacture declaration only. Null if absent, ambiguous or conflicting, including when only item origins are present. Never infer from item countries, export or shipper address.",
+    "export_country": "Explicit export/dispatch declaration or identified shipment departure/Ship From country. Null without departure evidence; a seller/shipper postal address alone is insufficient. Never substitute goods origin.",
+    "shipper_country": "Sender/shipper/from address country, or null if absent. When invoice-wide goods origin is declared, retain only an agreeing address country; otherwise null. Without invoice-wide origin, keep the address country. Never copy origin or export into this field.",
     "destination_country": "Actual goods delivery/Ship To country, separate from product origin and export country.",
     "receiver_country": "Country in the receiver's address.",
     "country_of_manufacture": (
         "Product country of origin/manufacture from explicit Country of Origin, COO, Made in, or Manufactured in evidence. "
-        "Item-specific evidence takes precedence over a declaration covering all goods. Never substitute the export/shipper country; "
+        "Item-specific evidence takes precedence over an unambiguous declaration explicitly covering that item or all goods. "
+        "Keep item-only origins on their items; never substitute the export/shipper country; "
         "null when product-origin evidence is absent."
     ),
 }

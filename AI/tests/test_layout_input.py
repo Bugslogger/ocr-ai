@@ -12,6 +12,7 @@ from AI.main import doc_pipeline
 from AI.model_config import EXTRACTION_CONFIG
 from AI.ocr import text_blocks
 from AI.utils import extract_doc, format_json
+from AI.tests.test_layout_compaction import expand_layout
 
 
 class LayoutInputTests(TestCase):
@@ -62,7 +63,7 @@ class LayoutInputTests(TestCase):
                             generate=generate)
             messages = generate.call_args.args[0]
             self.assertIn(plain, messages[1]["content"])
-            self.assertEqual(json.loads(messages[1]["content"].split("Layout-aware OCR (JSON):\n")[1]), layout)
+            self.assertEqual(expand_layout(messages[1]["content"].split("Layout-aware OCR (JSON):\n")[1]), layout)
 
     def test_native_and_scanned_pages_keep_their_own_coordinate_units(self):
         with TemporaryDirectory() as folder:
