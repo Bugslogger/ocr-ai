@@ -11,13 +11,24 @@ Resolve country roles before returning invoice fields. In any language or format
 identify the source label/address, its page and spatial group, and the scope of its
 value (address, whole invoice, or individual item). These are distinct roles:
 - order_level.shipper_country: the country in the sender/shipper/from address.
-  Application rule: when an invoice-wide goods origin is declared, shipper_country
-  must represent that same country or be null. If the sender address country differs
-  from the declared goods origin, return null for shipper_country; do not replace it
-  with the goods origin. If no invoice-wide goods origin is declared, keep the sender
-  address country. Return null without address evidence. Never copy export_country.
+  Keep this evidenced address country even when it differs from the declared goods
+  origin or export country. Return null only without address-country evidence.
+  Never copy origin_country or export_country into it, and never change goods origin
+  to match the shipper's address.
 - order_level.receiver_country: the country in the receiver's address. A billing
   address and the actual delivery address can differ.
+- Receiver name rule: if both destination_country and receiver_country are absent,
+  empty or unknown, return null for receiver_company, receiver_firstname and
+  receiver_lastname, even when a name is printed. Keep independently evidenced
+  phone/contact details. Never infer a country from the receiver's name or phone
+  number just to populate the name fields. If either country is available, extract
+  receiver names only from their own evidence.
+- receiver_company is an organization/company name only, never the customer's
+  personal first and last name. For an individual recipient without an organization,
+  return null for receiver_company and extract supported personal names into
+  receiver_firstname and receiver_lastname. If both an organization and a contact
+  person are printed, keep them in their respective fields. Do not split an
+  organization name into personal names or guess name parts when ambiguous.
 - order_level.destination_country: the actual Ship To/delivery country. Use explicit
   delivery evidence; do not substitute a different billing country.
 - order_level.export_country: the explicitly declared export/dispatch country or

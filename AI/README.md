@@ -363,16 +363,18 @@ Country roles are extracted independently from evidence in each invoice, includi
 
 | Field | Evidence and scope |
 | --- | --- |
-| `shipper_country` | Sender/shipper/from address country. With a declared invoice-wide goods origin, retain only an agreeing country; otherwise null. Without invoice-wide origin, retain the address country. Never copy origin or export into this field. |
+| `shipper_country` | Sender/shipper/from address country, retained even when it differs from goods origin or export. Null when address-country evidence is missing. Never copy origin or export into it, or change origin to match it. |
 | `receiver_country` | Receiver address country, which can differ from the actual delivery country. |
 | `destination_country` | Actual delivery/Ship To country; do not substitute a different billing country. |
 | `export_country` | Explicit export/dispatch declaration or identified shipment departure/Ship From country. A seller/shipper postal address alone is insufficient. |
 | `origin_country` | Explicit invoice-wide goods origin/manufacture declaration. Null if absent, ambiguous or conflicting. Item-only origins are not promoted, even when they all agree. |
 | Item `country_of_manufacture` | Item-specific origin first; otherwise an unambiguous goods-origin declaration explicitly covering that item or all goods; otherwise null. |
 
+When both `destination_country` and `receiver_country` are missing, null or blank, `apply_receiver_name_policy()` sets `receiver_company`, `receiver_firstname` and `receiver_lastname` to null before extraction is saved and returned. An available country in either field permits evidenced receiver names. Phone numbers and email remain unchanged; their presence never supplies a missing country. This rule is applied independently to each invoice.
+
 For address-only invoices, shipper and destination can be populated while origin, export and manufacturing countries remain null. Item exceptions to an invoice-wide origin affect only those items; they do not erase other items' default or the invoice declaration. The prompt instructs Qwen to reconstruct wrapped country headers within their own spatial columns before binding values, independently of flattened text order or country frequency. Origin tariff retrieval continues to use each item's manufacturing country.
 
-After schema validation and before saving extraction, `apply_shipper_country_policy()` enforces the shipper rule in code: a shipper country that cannot be confirmed to match a declared invoice-wide goods origin becomes null. Matching names are compared case-insensitively and known country aliases/ISO codes are compared by ISO identity. Origin, export, destination and item origins are not rewritten. Other evidence rules remain extraction instructions and schema field descriptions, not a deterministic label parser or a country inference fallback. Regression tests use model response fixtures to verify geometry delivery, null preservation, item scope, multi-invoice separation and API serialization. They do not prove that live Qwen follows the instructions on every invoice; rerun a known invoice and compare its countries with the source.
+Shipper country is preserved independently of goods origin; no postprocessing clears it merely because the two differ. Country evidence rules remain extraction instructions and schema field descriptions, not a deterministic label parser or a country inference fallback. Regression tests use model response fixtures to verify geometry delivery, null preservation, item scope, multi-invoice separation and API serialization. They do not prove that live Qwen follows the instructions on every invoice; rerun a known invoice and compare its countries with the source.
 
 Classification adds:
 

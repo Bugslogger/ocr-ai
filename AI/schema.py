@@ -36,10 +36,18 @@ COMPANY_DESCRIPTIONS = {
     "company_name": "Invoice issuer/seller name. First priority: the name printed with the issuer's postal address in the same block, ahead of a separate logo/brand. Never substitute buyer, receiver, carrier, or bank names. Null if unknown.",
     "company_address": "Postal address paired with the selected invoice issuer/seller company_name, from that same company's block. Never use another party's address. Null if absent.",
 }
+RECEIVER_NAME_DESCRIPTIONS = {
+    field: description + " Null when both destination_country and receiver_country are unavailable; never infer a country from a name or phone number."
+    for field, description in {
+        "receiver_company": "Receiver organization/company only. Null for a personal recipient without an organization; never use the customer's first and last name.",
+        "receiver_firstname": "Receiver contact's given name from personal-name evidence; never split an organization name to populate it.",
+        "receiver_lastname": "Receiver contact's family name from personal-name evidence; never split an organization name to populate it.",
+    }.items()
+}
 COUNTRY_DESCRIPTIONS = {
     "origin_country": "Explicit invoice-wide goods origin/manufacture declaration only. Null if absent, ambiguous or conflicting, including when only item origins are present. Never infer from item countries, export or shipper address.",
     "export_country": "Explicit export/dispatch declaration or identified shipment departure/Ship From country. Null without departure evidence; a seller/shipper postal address alone is insufficient. Never substitute goods origin.",
-    "shipper_country": "Sender/shipper/from address country, or null if absent. When invoice-wide goods origin is declared, retain only an agreeing address country; otherwise null. Without invoice-wide origin, keep the address country. Never copy origin or export into this field.",
+    "shipper_country": "Country evidenced by the sender/shipper/from address, or null if absent. Retain it even when different from goods origin or export. Never copy origin or export into it, or change origin to match it.",
     "destination_country": "Actual goods delivery/Ship To country, separate from product origin and export country.",
     "receiver_country": "Country in the receiver's address.",
     "country_of_manufacture": (
@@ -66,7 +74,8 @@ INVOICE_SCHEMA = object_schema({
 _invoice_properties = INVOICE_SCHEMA["properties"]["invoices"]["items"]["properties"]
 for _group in (_invoice_properties["order_level"]["properties"],
                _invoice_properties["item_level"]["items"]["properties"]):
-    for _field, _description in {**COMPANY_DESCRIPTIONS, **COUNTRY_DESCRIPTIONS}.items():
+    for _field, _description in {**COMPANY_DESCRIPTIONS, **COUNTRY_DESCRIPTIONS,
+                                 **RECEIVER_NAME_DESCRIPTIONS}.items():
         if _field in _group:
             _group[_field] = {**_group[_field], "description": _description}
 

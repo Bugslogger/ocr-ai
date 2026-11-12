@@ -14,11 +14,30 @@ import pymupdf
 
 from AI.model_config import EXTRACTION_CONFIG
 from AI.utils import extract_doc, format_json, update_invoice
+from AI.utils import apply_receiver_name_policy
 from server.schemas import InvoiceExtractionResponse
 from AI.tests.test_layout_compaction import expand_layout
 
 
 class CountryRoleTests(TestCase):
+    def test_person_name_duplicated_as_company_only_clears_company(self):
+        for company in ("Andrew Riggiannis", " ANDREW   Riggiannis ", "Riggiannis Andrew"):
+            with self.subTest(company=company):
+                order = {"receiver_company": company, "receiver_firstname": "Andrew",
+                         "receiver_lastname": "Riggiannis", "destination_country": "AUSTRALIA",
+                         "receiver_country": None, "receiver_phone_number": "+61 402 529 900",
+                         "receiver_email": "contact@example.test", "receiver_address1": "Delivery address"}
+                original = deepcopy(order)
+                result = apply_receiver_name_policy({"invoices": [{"order_level": order}]})
+                self.assertEqual(result["invoices"][0]["order_level"], {**original, "receiver_company": None})
+
+    def test_real_organization_is_not_cleared_when_contact_is_present(self):
+        order = {"receiver_company": "Andrew Riggiannis Trading Ltd", "receiver_firstname": "Andrew",
+                 "receiver_lastname": "Riggiannis", "receiver_country": "AUSTRALIA"}
+        original = deepcopy(order)
+        apply_receiver_name_policy({"invoices": [{"order_level": order}]})
+        self.assertEqual(order, original)
+
     def extract(self, source, payload, layout=None, expected_shippers=None):
         original = deepcopy(payload)
         generate = Mock(return_value=json.dumps(payload, ensure_ascii=False))
@@ -85,7 +104,7 @@ class CountryRoleTests(TestCase):
                                  "destination_country": "NEW ZEALAND"},
                  "item_level": [{"sku_code": "DUPLICATE", "country_of_manufacture": "JAPAN"}]},
                 {"order_level": {"shipper_country": "FRANCE", "destination_country": "GERMANY"},
-                 "item_level": [{"sku_code": "DUPLICATE", "country_of_manufacture": "SPAIN"}]}]}, expected_shippers=[None, "FRANCE"])
+                 "item_level": [{"sku_code": "DUPLICATE", "country_of_manufacture": "SPAIN"}]}]}, expected_shippers=["AUSTRALIA", "FRANCE"])
 
     def test_wrapped_country_columns_reach_model_with_geometry_and_correct_api_roles(self):
         with TemporaryDirectory() as folder:
@@ -109,7 +128,7 @@ class CountryRoleTests(TestCase):
             _, messages = self.extract(plain, {"invoices": [{
                 "order_level": {"origin_country": "JAPAN", "export_country": "AUSTRALIA",
                                 "shipper_country": "AUSTRALIA", "destination_country": "NEW ZEALAND"},
-                "item_level": [{"country_of_manufacture": "JAPAN"}]}]}, layout, expected_shippers=[None])
+                "item_level": [{"country_of_manufacture": "JAPAN"}]}]}, layout, expected_shippers=["AUSTRALIA"])
             self.assertIn(plain, messages[1]["content"])
             self.assertEqual(expand_layout(messages[1]["content"].split("Layout-aware OCR (JSON):\n")[1]),
                              json.loads(layout))
@@ -124,7 +143,7 @@ class CountryRoleTests(TestCase):
             "item_level": [{"sku_code": "A", "country_of_manufacture": "日本"},
                            {"sku_code": "B", "country_of_manufacture": "ドイツ"}]}]})
 
-    def test_shipper_policy_is_applied_to_saved_extraction_and_api(self):
+    def test_shipper_and_origin_stay_independent_in_saved_extraction_and_api(self):
         payload = {"invoices": [{"order_level": {
             "origin_country": "JAPAN", "export_country": "AUSTRALIA",
             "shipper_country": "AUSTRALIA", "destination_country": "NEW ZEALAND"},
@@ -136,20 +155,65 @@ class CountryRoleTests(TestCase):
             api = InvoiceExtractionResponse.model_validate(parsed).model_dump()
             for result in (parsed, saved, api):
                 order = result["invoices"][0]["order_level"]
-                self.assertIsNone(order["shipper_country"])
+                self.assertEqual(order["shipper_country"], "AUSTRALIA")
                 self.assertEqual(order["origin_country"], "JAPAN")
                 self.assertEqual(order["export_country"], "AUSTRALIA")
                 self.assertEqual(order["destination_country"], "NEW ZEALAND")
                 self.assertEqual(result["invoices"][0]["item_level"][0]["country_of_manufacture"], "JAPAN")
 
-    def test_agreeing_shipper_aliases_and_missing_values(self):
+    def test_shipper_is_preserved_independently_of_origin(self):
         for origin, shipper, expected in (
             ("Japan", "JP", "JP"), ("JAPAN", "japan", "japan"),
             ("日本", "日本", "日本"), ("JAPAN", None, None),
-            (None, "AUSTRALIA", "AUSTRALIA"), ("JAPAN", "unknown", None),
+            (None, "AUSTRALIA", "AUSTRALIA"), ("JAPAN", "GERMANY", "GERMANY"),
         ):
             with self.subTest(origin=origin, shipper=shipper):
                 api, _ = self.extract("Country evidence", {"invoices": [{
                     "order_level": {"origin_country": origin, "shipper_country": shipper},
                     "item_level": [{}]}]}, expected_shippers=[expected])
                 self.assertEqual(api["invoices"][0]["order_level"]["shipper_country"], expected)
+
+    def test_missing_receiver_and_destination_country_nulls_names_in_saved_and_api_results(self):
+        for countries in ({}, {"receiver_country": None, "destination_country": None},
+                          {"receiver_country": "", "destination_country": " \t"}):
+            with self.subTest(countries=countries), TemporaryDirectory() as folder:
+                order = {**countries, "receiver_company": "Andrew Riggiannis",
+                         "receiver_firstname": "Andrew", "receiver_lastname": "Riggiannis",
+                         "receiver_phone_number": "+61 402 529 900", "receiver_email": "contact@example.test",
+                         "shipper_country": "AUSTRALIA", "export_country": "AUSTRALIA"}
+                payload = {"invoices": [{"order_level": order, "item_level": [{}]}]}
+                parsed = format_json(cleaned_text="Recipient name and phone, no delivery country",
+                                     output_path=folder, generate=Mock(return_value=json.dumps(payload)))
+                saved = json.loads((Path(folder) / "extracted_invoice.json").read_text())
+                api = InvoiceExtractionResponse.model_validate(parsed).model_dump()
+                for result in (parsed, saved, api):
+                    actual = result["invoices"][0]["order_level"]
+                    for field in ("receiver_company", "receiver_firstname", "receiver_lastname"):
+                        self.assertIsNone(actual[field])
+                    self.assertEqual(actual["receiver_phone_number"], order["receiver_phone_number"])
+                    self.assertEqual(actual["receiver_email"], order["receiver_email"])
+                    self.assertEqual(actual["shipper_country"], "AUSTRALIA")
+                    self.assertEqual(actual["receiver_country"], countries.get("receiver_country"))
+                    self.assertEqual(actual["destination_country"], countries.get("destination_country"))
+
+    def test_either_delivery_or_receiver_country_preserves_receiver_names(self):
+        for countries in ({"destination_country": "AUSTRALIA"}, {"receiver_country": "AUSTRALIA"},
+                          {"destination_country": "日本", "receiver_country": ""}):
+            with self.subTest(countries=countries):
+                order = {**countries, "receiver_company": "Recipient", "receiver_firstname": "Given",
+                         "receiver_lastname": "Family", "receiver_phone_number": "+61 402 529 900"}
+                parsed = format_json(cleaned_text="Recipient with country", generate=Mock(return_value=json.dumps(
+                    {"invoices": [{"order_level": order, "item_level": [{}]}]})))
+                actual = InvoiceExtractionResponse.model_validate(parsed).model_dump()["invoices"][0]["order_level"]
+                for field in ("receiver_company", "receiver_firstname", "receiver_lastname", "receiver_phone_number"):
+                    self.assertEqual(actual[field], order[field])
+
+    def test_receiver_name_policy_is_scoped_to_each_invoice(self):
+        names = {"receiver_company": "Recipient", "receiver_firstname": "Given", "receiver_lastname": "Family"}
+        parsed = format_json(cleaned_text="Two invoices, only the first has a delivery country",
+                             generate=Mock(return_value=json.dumps({"invoices": [
+                                 {"order_level": {**names, "destination_country": "AUSTRALIA"}, "item_level": [{}]},
+                                 {"order_level": names, "item_level": [{}]}]})))
+        for field, value in names.items():
+            self.assertEqual(parsed["invoices"][0]["order_level"][field], value)
+            self.assertIsNone(parsed["invoices"][1]["order_level"][field])

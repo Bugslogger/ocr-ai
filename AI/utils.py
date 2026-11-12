@@ -224,24 +224,20 @@ def save_json(path, value):
     path.write_text(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8")
 
 
-def apply_shipper_country_policy(invoice_data):
-    """With declared goods origin, expose only an agreeing shipper country or null.
-
-    No country is copied to another role. Address-only and item-origin-only
-    invoices retain their extracted shipper address country.
-    """
-    from .tariff import iso2_from_country
-
+def apply_receiver_name_policy(invoice_data):
+    """Apply receiver name rules without changing countries or contact fields."""
     for invoice in invoice_data["invoices"]:
         order = invoice["order_level"]
-        origin, shipper = order.get("origin_country"), order.get("shipper_country")
-        if not origin or not shipper:
-            continue
-        if origin.strip().casefold() == shipper.strip().casefold():
-            continue
-        origin_iso, shipper_iso = iso2_from_country(origin), iso2_from_country(shipper)
-        if not origin_iso or origin_iso != shipper_iso:
-            order["shipper_country"] = None
+        if not any((order.get(field) or "").strip()
+                   for field in ("destination_country", "receiver_country")):
+            for field in ("receiver_company", "receiver_firstname", "receiver_lastname"):
+                order[field] = None
+        else:
+            first = " ".join((order.get("receiver_firstname") or "").split()).casefold()
+            last = " ".join((order.get("receiver_lastname") or "").split()).casefold()
+            company = " ".join((order.get("receiver_company") or "").split()).casefold()
+            if first and last and company in (f"{first} {last}", f"{last} {first}"):
+                order["receiver_company"] = None
     return invoice_data
 
 
@@ -271,7 +267,8 @@ def format_json(Qtokenizer=None, Qmodel=None, system_prompt=None, *, cleaned_tex
         response = generate(messages, **Qconfig)
         try:
             with timed_stage("validating_invoice_json"):
-                parsed = apply_shipper_country_policy(validate_invoice(parse_json_maybe(response)))
+                parsed = validate_invoice(parse_json_maybe(response))
+                parsed = apply_receiver_name_policy(parsed)
         except json.JSONDecodeError as error:
             if output_path:
                 destination = Path(output_path)
