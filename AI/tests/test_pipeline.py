@@ -764,6 +764,7 @@ class PipelineTests(TestCase):
                 "AI.main.format_json", return_value={"invoices": [invoice()]}
             ), patch("AI.db_connect.connect_vdb", return_value={"weaviate_client": client}), patch(
                 "AI.main.WeaviateRetriever.load_country_map", side_effect=ConnectionError("country service unavailable")
+            ), patch("AI.main.CatalogRetriever.load", return_value=CatalogRetriever(ROWS)
             ):
                 with self.assertRaisesRegex(ConnectionError, "country service unavailable"):
                     doc_pipeline(pdf, Path(folder) / "output", backend="weaviate", models={"ocr": {}}, generate=Mock())

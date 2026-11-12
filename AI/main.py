@@ -67,8 +67,12 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
                                                           national_path or os.getenv("NATIONAL_INDEX_PATH"))
                     elif backend == "weaviate":
                         from .db_connect import connect_vdb
+                        from .hs_pipeline import CatalogWeaviateRetriever
+                        catalog = CatalogRetriever.load(catalog_path or os.getenv("HS_CATALOG_PATH")
+                                                        or Path(__file__).resolve().parents[1] / "harmonized-system.csv")
                         connection = connect_vdb()["weaviate_client"]
-                        retriever = WeaviateRetriever(connection, WeaviateRetriever.load_country_map())
+                        retriever = CatalogWeaviateRetriever(
+                            catalog, WeaviateRetriever(connection, WeaviateRetriever.load_country_map()), generate, report)
                     else:
                         raise ValueError(f"Unknown retrieval backend: {backend}")
             report("retrieving_tariffs")

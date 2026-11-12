@@ -19,9 +19,11 @@ flowchart TD
     F --> P[Identify products with Qwen when tariff lookup is needed]
     P --> G{Retrieval backend}
     G --> H[International HS catalog and national overlays]
-    G --> I[Country filtered Weaviate keyword search]
+    G --> I[Shared in-memory HS catalog]
+    I --> S[Qwen selects and validates HS6]
+    S --> W[Country and HS6 filtered Weaviate extensions]
     H --> J[Candidates keyed by invoice and item position]
-    I --> J
+    W --> J
     J --> K[Qwen selects HS6 and optional national codes]
     K --> L[Validate membership and HS6 prefixes]
     L --> M[Preserve invoice evidence and set review flags]
@@ -33,7 +35,7 @@ flowchart TD
 2. **Use plain text and spatial evidence.** Qwen receives `extracted_text.txt` unchanged plus `layout_aware_text.txt` by default. Layout input contains page dimensions, units, original recognition order, text, bounding boxes and optional confidence. There is no markup stripping, entity decoding, or whitespace cleanup step. Empty extracted text stops the run.
 3. **Extract.** Qwen receives the text and the shared JSON Schema. It extracts invoice, shipment, and line-item fields without inferring tariff codes. Missing values are null. Manufacturing country must come from product evidence; it is not copied from the sender's address.
 4. **Validate extraction.** Missing invoice data fields are filled with null before validation, including fields in omitted order and shipment objects. Malformed JSON, unexpected fields, incorrect supplied field types, empty invoice lists, and empty item lists stop the run. Valid extraction is saved before classification modifies it.
-5. **Retrieve missing codes.** Country-specific codes explicitly printed on the invoice take precedence. Items with both structurally valid national codes skip retrieval and classification; if every item is complete, the tariff backend is never opened or downloaded. For incomplete items, Weaviate queries only countries whose codes are missing or malformed. Records use `(invoice_index, item_index)`, so SKU collisions cannot overwrite another item's results. Country lookup uses exact names, ISO codes, and explicit aliases.
+5. **Retrieve missing codes.** Country-specific codes explicitly printed on the invoice take precedence. Items with both structurally valid national codes skip retrieval and classification; if every item is complete, the tariff backend is never opened or downloaded. For incomplete items in Weaviate mode, Qwen first selects HS6 from the shared catalog. Weaviate then queries only that HS6 prefix in countries whose codes are missing or malformed. Records use `(invoice_index, item_index)`, so SKU collisions cannot overwrite another item's results. Country lookup uses exact names, ISO codes, and explicit aliases.
 6. **Select and validate.** Qwen may choose only retrieved HS6 values. Each national code must occur in the corresponding country's candidate list and extend the chosen HS6. Invalid selections are rejected before formatting. An item's classification failure becomes a reviewable result; processing continues for other items.
 7. **Persist.** Each item receives classification fields, evidence, and review status. The complete result is written to `final_classification.json` and returned to the caller.
 
@@ -47,7 +49,8 @@ flowchart TD
 | `utils.py` | PDF rendering, OCR, Qwen generation, extraction, and output writing |
 | `schema.py` | Shared extraction contract and JSON Schema validation |
 | `prompt.py` | Extraction instructions generated around that contract |
-| `tariff.py` | Country resolution, retrieval backends, candidate validation, and classification |
+| `tariff.py` | Country resolution, shared catalog cache, national retrieval, candidate validation, and classification |
+| `hs_pipeline.py` | Catalog HS6 selection before country-specific Weaviate lookup |
 | `db_connect.py` | Weaviate connection without API-key authentication |
 | `model_config.py` | All model names, revisions, OCR settings, quantization, devices, precision, and generation budgets |
 | `config.py` | Environment-based database settings and compatibility imports for model settings |
@@ -295,7 +298,9 @@ For repeated documents, call `doc_pipeline()` with a different output directory 
 
 Set `--catalog` or `HS_CATALOG_PATH` to a local CSV. Without a local path, catalog mode downloads the [public Harmonized System dataset](https://github.com/datasets/harmonized-system) over HTTPS with a timeout. Network failure stops the run; an unrelated fallback catalog is not substituted.
 
-CSV rows require a code field (`hscode`, `hs_code`, or `code`) and a description field (`description` or `title`). Two- and four-digit rows provide parent context; six-digit rows are selectable candidates. Retrieval scores overlapping words with inverse document frequency, including parent descriptions. It returns at most 12 HS6 candidates per item.
+Catalog files and their prepared search indexes are cached once per API process, keyed by resolved catalog and national-overlay paths. All extraction workers reuse the same catalog. No file read or index rebuild occurs for subsequent invoices or line items using those paths. Restart the server after replacing a catalog, or explicitly call `CatalogRetriever.clear_cache()` in controlled Python use. First loading is protected by a lock so concurrent workers cannot create duplicate indexes. Failed loads are not cached.
+
+CSV rows require a code field (`hscode`, `hs_code`, or `code`) and a description field (`description` or `title`). Two- and four-digit rows provide parent context; six-digit rows are selectable candidates. Retrieval scores overlapping words with inverse document frequency, including parent descriptions. It returns at most 12 HS6 candidates per item. Rows marked `section=TOTAL`, including aggregate code `999999`, are excluded from product classification.
 
 National overlays are optional JSON arrays configured by `--national-index` or `NATIONAL_INDEX_PATH`. Each row has:
 
@@ -329,7 +334,16 @@ The database connection does not require an API key and sends no authentication 
 
 The `Hs_category` collection must expose `country_code`, `code`, `description`, and `indent` properties. `country_code` is queried as a string. Country database IDs are mapped from `https://bapi.logistx.us/his_countries`. API labels such as `Finland - FI (EU)` are parsed using their validated ISO suffix. Standard country entries take precedence over alternate schedules such as `Israel (11 digits) - IL`, regardless of API order. Inactive and invalid entries are skipped; conflicting standard IDs fail explicitly. An unavailable API fails the run; an unmapped country produces no candidates for that role.
 
-BM25 retrieves at most 25 rows per distinct origin/destination country. A second country-filtered code-prefix lookup retrieves up to 100 rows per country, including national entries described only as "Other" that keyword search misses. Prefixes come from invoice tariff evidence when available, otherwise from the retrieved HS6 candidates. Six-digit rows provide international candidates; longer national rows provide candidates unless marked as non-leaf headings. New Zealand statistical check letters are retained and validated within that jurisdiction. Parent descriptions are supplied where retrieved to clarify titles such as "Other". Duplicate national codes are removed, and inactive/deleted rows are excluded. Destination uses `destination_country`, falling back to `receiver_country`. Origin and destination share lookups when the countries match. Search relevance is not used to fabricate a parent-child tree. This backend's candidate coverage depends on database contents and the search limits; the model must still select and validate a suitable national code.
+The invoice pipeline uses `CatalogWeaviateRetriever`: the local HS catalog selects the international code first, and Weaviate supplies only national extensions beneath that code.
+
+1. Load `/root/ocr-ai/harmonized-system.csv` (the repository-root CSV) lazily on first use and reuse the in-memory index across invoices and workers. Override with `HS_CATALOG_PATH` or the CLI `--catalog` argument. A missing or invalid local catalog fails explicitly; this Weaviate flow does not silently download a different edition. Ensure the CSV is included when deploying the project.
+2. Rank catalog HS6 candidates from the identified product description and parent context. Existing invoice tariff evidence constrains the permissible prefix. Qwen selects only a catalog candidate; a four-digit printed heading constrains the six-digit selection without inventing suffixes. Invalid or unavailable selections produce a reviewable item and do not trigger country queries.
+3. Query `Hs_category` using the database country ID and the selected six-digit prefix, including compact and common dotted code representations. This path does not run a broad BM25 product search. Country-scoped results are paginated in batches of at least 100; there is no silent first-page-only truncation. Returned codes are rechecked for the selected HS6, active/deleted status and leaf status, and deduplicated. New Zealand check letters are preserved.
+4. Use product details and the selected catalog description/parent to choose national extensions. Each selection must belong to that country's retrieved candidates and extend the locked HS6. The national model cannot replace the international selection with an unrelated code. If no national rows exist or a national selection fails validation, keep the catalog-selected `hs6_code`, leave unavailable national fields null and flag review. Uncertainty from HS6 selection carries into the final result.
+
+Origin uses the item's manufacturing country; export and shipper countries are not substitutes. Destination uses `destination_country`, falling back to `receiver_country`. Unknown or unmapped countries are skipped, identical origin/destination countries share a query, and roles with valid printed national codes skip their lookup. Items already containing both valid national codes retain the existing lookup/classification bypass. The invoice extraction schema and receiver/country rules are unchanged.
+
+`db_matches.json` includes the catalog source and per-item `hs_selection` so the international decision can be inspected before national classification. Progress events include `selecting_hs6` and `retrieving_national_tariffs`. Direct legacy calls to `WeaviateRetriever.retrieve()` retain their keyword-search behavior; the invoice pipeline calls its strict `retrieve_by_hs6()` method through the new coordinator.
 
 The pipeline closes the Weaviate connection in a `finally` block, including on failure. Callers using `connect_vdb()` themselves own and must close its returned client.
 

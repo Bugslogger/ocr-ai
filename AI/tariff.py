@@ -6,6 +6,7 @@ import io
 import json
 import math
 import re
+from threading import RLock
 from .model_config import TARIFF_GENERATION_CONFIG
 from urllib.request import urlopen
 
@@ -86,11 +87,16 @@ def tokens(text):
 
 class CatalogRetriever:
     """Rank HS6 titles with parent context; national codes come only from overlays."""
+    _cache = {}
+    _cache_lock = RLock()
+
     def __init__(self, rows, national_rows=(), top_k=12, source="local catalog"):
         self.top_k = top_k
         self.source = source
         self.by_code = {}
         for row in rows:
+            if row.get("section") == "TOTAL":
+                continue  # Aggregate/statistical rows are not product classifications.
             code = code_digits(row.get("hscode") or row.get("hs_code") or row.get("code"))
             description = row.get("description") or row.get("title") or ""
             if code and len(code) in (2, 4, 6) and description:
@@ -113,6 +119,23 @@ class CatalogRetriever:
 
     @classmethod
     def load(cls, catalog_path=None, national_path=None):
+        catalog_path = str(Path(catalog_path).expanduser().resolve()) if catalog_path else None
+        national_path = str(Path(national_path).expanduser().resolve()) if national_path else None
+        key = (cls, catalog_path, national_path)
+        # Hold the lock during the first load: concurrent workers share one index.
+        with cls._cache_lock:
+            if key not in cls._cache:
+                cls._cache[key] = cls._load(catalog_path, national_path)
+            return cls._cache[key]
+
+    @classmethod
+    def clear_cache(cls):
+        """Explicitly reload catalogs on the next use; ordinarily restart the API."""
+        with cls._cache_lock:
+            cls._cache.clear()
+
+    @classmethod
+    def _load(cls, catalog_path=None, national_path=None):
         if catalog_path:
             source = str(catalog_path)
             text = Path(catalog_path).read_text(encoding="utf-8-sig")
@@ -151,6 +174,50 @@ class WeaviateRetriever:
         self.collection = client.collections.get(collection)
         self.country_map = country_map
         self.limit = limit
+
+    def retrieve_by_hs6(self, item, order, hs6):
+        """Fetch national extensions only under an already validated catalog HS6."""
+        from weaviate.classes.query import Filter
+
+        if not isinstance(hs6, str) or not re.fullmatch(r"[0-9]{6}", hs6):
+            raise ValueError("National lookup requires an exact six-digit HS code")
+        origin = iso2_from_country(item.get("country_of_manufacture"))
+        destination = iso2_from_country(order.get("destination_country") or order.get("receiver_country"))
+        countries = sorted({iso for iso, field in (
+            (origin, "manufacturing_country_hts_code"), (destination, "destination_country_hts_code")
+        ) if iso and invoice_national_code(item, field, iso) is None})
+        hits = {}
+        code_filter = Filter.any_of([
+            Filter.by_property("code").like(pattern)
+            for pattern in (hs6 + "*", hs6[:4] + "." + hs6[4:] + "*")
+        ])
+        for iso in countries:
+            hits[iso] = {}
+            if iso not in self.country_map:
+                continue
+            offset, page_size = 0, max(100, self.limit)
+            while True:
+                response = self.collection.query.fetch_objects(
+                    filters=Filter.by_property("country_code").equal(self.country_map[iso]) & code_filter,
+                    return_properties=["code", "description", "isactive", "isdelete", "is_leaf"],
+                    limit=page_size, offset=offset,
+                )
+                for obj in response.objects:
+                    props = obj.properties
+                    key = national_code_key(props.get("code"), iso)
+                    digits = re.match(r"[0-9]+", key)[0] if key else ""
+                    if (props.get("isactive") is False or props.get("isdelete") is True
+                            or props.get("is_leaf") is False or not digits.startswith(hs6)
+                            or not 7 <= len(digits) <= 12):
+                        continue
+                    hits[iso][key] = {"jurisdiction": iso, "hs6": hs6, "national_code": props["code"],
+                                      "title": props.get("description"), "id": str(obj.uuid)}
+                if len(response.objects) < page_size:
+                    break
+                offset += page_size
+        return {"origin_candidates": list(hits.get(origin, {}).values()),
+                "destination_candidates": list(hits.get(destination, {}).values()),
+                "origin_iso": origin, "destination_iso": destination, "source": "Weaviate Hs_category"}
 
     @staticmethod
     def load_country_map(url="https://bapi.logistx.us/his_countries"):
@@ -309,6 +376,10 @@ def classify_item(item, order, matches, generate):
     note = reason
     selection = {}
     candidates = matches["hs_candidates"]
+    hs_selection = matches.get("hs_selection")
+    catalog_hs6 = hs_selection.get("hs6") if hs_selection else None
+    if catalog_hs6 not in {row["hs_code"] for row in candidates}:
+        catalog_hs6 = None
     invoice_origin = item.get("manufacturing_country_hts_code")
     origin_key = national_code_key(invoice_origin, matches["origin_iso"])
     origin_digits = re.match(r"[0-9]+", origin_key)[0] if origin_key else None
@@ -331,7 +402,8 @@ def classify_item(item, order, matches, generate):
         candidates = [row for row in candidates if row["hs_code"].startswith(prefix)]
         if not candidates:
             note = reason = "No retrieved HS6 matches the invoice tariff code; manual review required"
-    if not invoice_complete and desc.strip() and candidates:
+    if (not invoice_complete and desc.strip() and candidates
+            and (not hs_selection or matches["origin_candidates"] or matches["destination_candidates"])):
         allowed_hs = {row["hs_code"] for row in candidates}
         prompt = {
             "product": desc, "sku": item.get("sku_code"),
@@ -386,6 +458,25 @@ def classify_item(item, order, matches, generate):
             note = reason = f"Classification failed: {exc}"
             review = True
             confidence = "LOW"
+    if hs_selection:
+        if catalog_hs6 and hs6 is None:
+            # A missing/rejected national selection must not erase verified HS6.
+            hs6 = catalog_hs6
+            reason = hs_selection["classification_reason"]
+            if not matches["origin_candidates"] and not matches["destination_candidates"]:
+                note = "No national extensions available for selected catalog HS6"
+            note += "; HS6 retained from catalog selection"
+            confidence = hs_selection["confidence"]
+            review = True
+        elif not catalog_hs6:
+            reason = note = hs_selection["classification_reason"]
+        if (hs_selection.get("needs_review") or hs_selection.get("confidence") == "LOW"
+                or (not orig_nat and not invoice_origin_valid)):
+            review = True
+        if hs_selection.get("confidence") == "LOW":
+            confidence = "LOW"
+        elif hs_selection.get("confidence") == "MEDIUM" and confidence == "HIGH":
+            confidence = "MEDIUM"
     if not matches["destination_iso"]:
         review = True
         note += "; destination country unknown"

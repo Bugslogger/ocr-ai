@@ -32,6 +32,8 @@ STAGES = {
     "identifying_product": (60, "Identifying an invoice product"),
     "loading_product_model": (60, "Loading or reusing the product identification model"),
     "retrieving_tariffs": (75, "Retrieving tariff candidates for invoice items"),
+    "selecting_hs6": (75, "Selecting international HS6 from the in-memory catalog"),
+    "retrieving_national_tariffs": (75, "Retrieving country-specific extensions under the selected HS6"),
     "classifying_items": (85, "Classifying items and validating tariff codes"),
     "completed": (99, "Validating and saving the final result"),
     "failed": (0, "Invoice processing failed"),
