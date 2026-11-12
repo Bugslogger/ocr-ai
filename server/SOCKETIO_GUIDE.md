@@ -18,7 +18,7 @@ For a frontend running on a different origin, set the allowed frontend origins *
 export SOCKETIO_ALLOWED_ORIGINS='http://localhost:3000,http://localhost:5173,https://your-frontend.example'
 ```
 
-The default allowed origin is `https://dev.admin.logistx.us`. An explicitly empty `SOCKETIO_ALLOWED_ORIGINS` restores same-origin checking. Origins include scheme and port, without a path or trailing slash. This setting controls Socket.IO only; REST CORS is configured separately in `server/app.py` and currently permits `https://dev.admin.logistx.us`. Use one server process per GPU with the existing process-local queue and model cache.
+The default allowed origins are `https://dev.admin.logistx.us`, `http://localhost:3000`, `http://localhost:5173`, `http://127.0.0.1:3000`, and `http://127.0.0.1:5173`. Set `SOCKETIO_ALLOWED_ORIGINS` to a comma-separated list to override these defaults or allow another local port. An explicitly empty value restores same-origin checking. Origins include scheme and port, without a path or trailing slash. This setting controls Socket.IO only; REST CORS is configured separately in `server/app.py` and currently permits `https://dev.admin.logistx.us`. Use one server process per GPU with the existing process-local queue and model cache.
 
 Install the browser client in your frontend project:
 

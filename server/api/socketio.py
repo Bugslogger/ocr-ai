@@ -46,7 +46,11 @@ class InvoiceSocketIO:
     def __init__(self, jobs=None, gpu=None):
         self.jobs = jobs if jobs is not None else invoice_jobs
         self.gpu = gpu if gpu is not None else monitor
-        origins = os.getenv("SOCKETIO_ALLOWED_ORIGINS", "https://dev.admin.logistx.us")
+        origins = os.getenv(
+            "SOCKETIO_ALLOWED_ORIGINS",
+            "https://dev.admin.logistx.us,http://localhost:3000,http://localhost:5173,"
+            "http://127.0.0.1:3000,http://127.0.0.1:5173",
+        )
         allowed = [item.strip() for item in origins.split(",") if item.strip()] or None
         self.sio = socketio.AsyncServer(
             async_mode="asgi", cors_allowed_origins=allowed,
