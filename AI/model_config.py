@@ -19,13 +19,15 @@ MODEL_CACHE_CONFIG = {
 }
 
 QWEN_GENERATION_CONFIG = {
-    "max_new_tokens": int(os.getenv("QWEN_MAX_NEW_TOKENS", "15000")),
+    "max_new_tokens": int(os.getenv("QWEN_MAX_NEW_TOKENS", "10000")),
     "temperature": 0.0,
 }
 QWEN_RUNTIME_CONFIG = {
     "device": os.getenv("QWEN_DEVICE", "cuda:0"),
     "compute_dtype": os.getenv("QWEN_COMPUTE_DTYPE", "bfloat16"),
     "max_context_tokens": int(os.getenv("QWEN_MAX_CONTEXT_TOKENS", "32768")),
+    "min_output_tokens": int(os.getenv("QWEN_MIN_OUTPUT_TOKENS", "2048")),
+    "context_safety_margin": 512,
 }
 OCR_CONFIG = {
     "dpi": int(os.getenv("OCR_DPI", "250")),
@@ -33,6 +35,11 @@ OCR_CONFIG = {
     "recognition_batch_size": int(os.getenv("OCR_RECOGNITION_BATCH_SIZE", "32")),
     "pdf_text_first": os.getenv("PDF_TEXT_FIRST", "true").lower() in {"true", "1", "yes"},
     "pdf_text_min_chars": int(os.getenv("PDF_TEXT_MIN_CHARS", "40")),
+}
+
+# Capture layout for every document; this switch controls only Qwen's input.
+EXTRACTION_CONFIG = {
+    "layout_aware": os.getenv("LAYOUT_AWARE_EXTRACTION", "true").lower() in {"true", "1", "yes"},
 }
 
 # Apply before importing Paddle so OCR allocates GPU memory as needed.

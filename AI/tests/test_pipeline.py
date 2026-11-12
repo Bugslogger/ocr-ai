@@ -19,6 +19,11 @@ from AI.tariff import (CatalogRetriever, WeaviateRetriever, classify_item,
 from AI.utils import clean_ocr_text, extract_doc, format_json, qwen_generate, pdf_to_images
 
 
+def save_fake_extraction(output, text):
+    (output / "extracted_text.txt").write_text(text, encoding="utf-8")
+    (output / "layout_aware_text.txt").write_text('{"pages":[]}', encoding="utf-8")
+
+
 def ocr_result(text):
     return {"rec_texts": [text], "rec_boxes": [[0, 0, 200, 20]]}
 
@@ -84,7 +89,7 @@ class WorkerConcurrencyTests(TestCase):
         def extract(*args, **kwargs):
             # Exercise the nested product lock while the invoice lock is held.
             identify_products({"invoices": [invoice()]}, generate=Mock())
-            (args[1] / "extracted_text.txt").write_text("invoice", encoding="utf-8")
+            save_fake_extraction(args[1], "invoice")
 
         def run(pdf, output):
             with model_context():
@@ -505,10 +510,10 @@ class ExternalBoundaryTests(TestCase):
         tokenizer.return_value = inputs
         model = Mock()
         model.config.max_position_embeddings = 6
-        with self.assertRaisesRegex(ValueError, "exceeds model context"):
+        with self.assertRaisesRegex(ValueError, "Document input is too large"):
             qwen_generate([], tokenizer, model, max_new_tokens=4)
         model.generate.assert_not_called()
-        model.config.max_position_embeddings = 20
+        model.config.max_position_embeddings = 32768
         model.generate.return_value = torch.tensor([[1, 2, 3, 4, 5, 6, 7]])
         with self.assertRaisesRegex(RuntimeError, "token limit"):
             qwen_generate([], tokenizer, model, max_new_tokens=4)
@@ -536,7 +541,7 @@ class ExternalBoundaryTests(TestCase):
         tokenizer.decode.return_value = '{"ok":true}'
         model = Mock()
         model.device = torch.device("cpu")
-        model.config.max_position_embeddings = 20
+        model.config.max_position_embeddings = 32768
 
         def generate(**kwargs):
             # Simulate generate() merging call options with pretrained defaults.
@@ -757,7 +762,7 @@ class PipelineTests(TestCase):
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
             client = Mock()
-            with patch("AI.main.extract_doc", side_effect=lambda pdf, output, *a, **kw: (output / "extracted_text.txt").write_text("Invoice", encoding="utf-8")), patch(
+            with patch("AI.main.extract_doc", side_effect=lambda pdf, output, *a, **kw: save_fake_extraction(output, "Invoice")), patch(
                 "AI.main.format_json", return_value={"invoices": [invoice()]}
             ), patch("AI.db_connect.connect_vdb", return_value={"weaviate_client": client}), patch(
                 "AI.main.WeaviateRetriever.load_country_map", side_effect=ConnectionError("country service unavailable")
@@ -775,14 +780,15 @@ class PipelineTests(TestCase):
         with TemporaryDirectory() as folder:
             pdf = Path(folder) / "invoice.pdf"
             make_pdf(pdf)
-            with patch("AI.main.extract_doc", side_effect=lambda pdf, output, *a, **kw: (output / "extracted_text.txt").write_text(extracted, encoding="utf-8")), patch(
+            with patch("AI.main.extract_doc", side_effect=lambda pdf, output, *a, **kw: save_fake_extraction(output, extracted)), patch(
                 "AI.db_connect.connect_vdb", side_effect=AssertionError("DB must not be contacted")
             ) as connect, patch("AI.main.CatalogRetriever.load") as load_catalog:
                 result = doc_pipeline(pdf, Path(folder) / "out", backend="weaviate", models={"ocr": {}}, generate=generate)
             connect.assert_not_called()
             load_catalog.assert_not_called()
             generate.assert_called_once()  # Extraction only; no classification.
-            self.assertEqual(generate.call_args.args[0][1]["content"], "OCR Text:\n\n" + extracted)
+            self.assertEqual(generate.call_args.args[0][1]["content"], "OCR Text:\n\n" + extracted
+                             + '\n\nLayout-aware OCR (JSON):\n{"pages":[]}')
             self.assertFalse((Path(folder) / "out" / "plain_invoice_text.txt").exists())
             item = result["invoices"][0]["item_level"][0]
             self.assertEqual(item["hs_code"], "8544")

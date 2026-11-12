@@ -38,8 +38,10 @@ def doc_pipeline(doc_path, output_path=None, *, catalog_path=None, national_path
                 generate = make_generator(**models["qwen"])
             extract_doc(pdf, destination, models.get("ocr"), progress=report)
             extracted = (destination / "extracted_text.txt").read_text(encoding="utf-8")
+            layout = (destination / "layout_aware_text.txt").read_text(encoding="utf-8")
             report("extracting_json")
-            parsed = format_json(cleaned_text=extracted, output_path=destination, generate=generate)
+            parsed = format_json(cleaned_text=extracted, layout_text=layout,
+                                 output_path=destination, generate=generate)
             missing_codes = any(needs_tariff_lookup(item, inv["order_level"]) for inv in parsed["invoices"] for item in inv["item_level"])
             if missing_codes:
                 report("identifying_products")

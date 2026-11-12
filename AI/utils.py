@@ -59,7 +59,7 @@ def _model_part(bundle, key):
 def extract_doc(doc_path, output_path, model=None, *, progress=None, force_ocr=False):
     """Use native PDF text first; lazily OCR only pages needing recognition."""
     from .model_config import Oconfig
-    from .ocr import page_text
+    from .ocr import page_text, text_blocks
     from .pdf_text import extract_pdf_pages
 
     pdf = Path(doc_path).expanduser().resolve()
@@ -72,7 +72,8 @@ def extract_doc(doc_path, output_path, model=None, *, progress=None, force_ocr=F
     with timed_stage("extracting_pdf_text") as metrics:
         # Forced OCR still opens/validates the PDF but accepts no native pages.
         minimum = Oconfig["pdf_text_min_chars"] if Oconfig["pdf_text_first"] and not force_ocr else float("inf")
-        pages = extract_pdf_pages(pdf, PDF_LOCK, minimum)
+        layout_pages = []
+        pages = extract_pdf_pages(pdf, PDF_LOCK, minimum, layout_pages=layout_pages)
         missing = [i for i, text in enumerate(pages) if text is None]
         metrics.update(pages=len(pages), native_pages=len(pages) - len(missing), ocr_pages=len(missing))
     if missing:
@@ -94,6 +95,13 @@ def extract_doc(doc_path, output_path, model=None, *, progress=None, force_ocr=F
                         if not text.strip():
                             raise RuntimeError(f"OCR returned no usable text on page {index + 1}/{len(pages)}; refusing a partial invoice")
                         pages[index] = text
+                        # The OCR boxes refer to the rendered image, not PDF points.
+                        from PIL import Image
+                        with Image.open(path) as image:
+                            width, height = image.size
+                        layout_pages[index] = {"page_number": index + 1, "width": width, "height": height,
+                                               "coordinate_unit": "pixels", "source": "ocr",
+                                               "blocks": text_blocks(results[0])}
     # Escape model text before legacy markup cleanup; literal < and > in invoice
     # values must not be mistaken for the old OCR's HTML tags.
     from html import escape
@@ -101,6 +109,10 @@ def extract_doc(doc_path, output_path, model=None, *, progress=None, force_ocr=F
     with timed_stage("saving_document_text"):
         (destination / "extracted_text.txt").write_text("\n\n".join(pages), encoding="utf-8")
         (destination / "detailed_invoice_output.txt").write_text(raw, encoding="utf-8")
+        layout = {"coordinate_system": "top_left_origin_x_right_y_down", "pages": layout_pages}
+        save_json(destination / "document_layout.json", layout)
+        (destination / "layout_aware_text.txt").write_text(
+            json.dumps(layout, ensure_ascii=False, separators=(",", ":"), allow_nan=False), encoding="utf-8")
     return raw
 
 
@@ -152,8 +164,25 @@ def qwen_generate(messages, Qtokenizer, Qmodel, max_new_tokens=None, temperature
     input_length = inputs.input_ids.shape[-1]
     limit = min(getattr(Qmodel.config, "max_position_embeddings", None) or Qruntime["max_context_tokens"],
                 Qruntime["max_context_tokens"])
-    if limit and input_length + max_new_tokens > limit:
-        raise ValueError(f"Prompt ({input_length}) plus output budget ({max_new_tokens}) exceeds model context ({limit}). Split the document or reduce the budget.")
+    configured_output_tokens = max_new_tokens
+    safety_margin = Qruntime["context_safety_margin"]
+    available_output_tokens = limit - input_length - safety_margin
+    max_new_tokens = max(0, min(configured_output_tokens, available_output_tokens))
+    budget_metrics = dict(input_tokens=input_length,
+                          configured_output_tokens=configured_output_tokens,
+                          effective_output_tokens=max_new_tokens, context_limit=limit,
+                          available_output_tokens=available_output_tokens, safety_margin=safety_margin)
+    # Record budgets on accepted and rejected calls without logging document text.
+    with timed_stage("qwen_context_budget", **budget_metrics):
+        if configured_output_tokens <= 0:
+            raise ValueError("Qwen configured output budget must be positive")
+        if available_output_tokens < Qruntime["min_output_tokens"]:
+            raise ValueError(
+                f"Document input is too large: {input_length} input tokens with context limit {limit} "
+                f"and safety margin {safety_margin} leave {available_output_tokens} available output tokens; "
+                f"at least {Qruntime['min_output_tokens']} are required. "
+                "Split the document or reduce its input before retrying. No input was truncated."
+            )
     options = dict(max_new_tokens=max_new_tokens, do_sample=temperature > 0,
                    eos_token_id=Qtokenizer.eos_token_id, pad_token_id=Qtokenizer.eos_token_id)
     if temperature > 0:
@@ -162,7 +191,7 @@ def qwen_generate(messages, Qtokenizer, Qmodel, max_new_tokens=None, temperature
         # Override sampling defaults inherited from the model's generation_config.
         # Omitting them leaves Qwen's sampling settings active in greedy mode.
         options.update(temperature=None, top_p=None, top_k=None)
-    with torch.inference_mode(), timed_stage("qwen_decode", input_tokens=input_length,
+    with torch.inference_mode(), timed_stage("qwen_decode", **budget_metrics,
                                               max_new_tokens=max_new_tokens) as metrics:
         generated = Qmodel.generate(**inputs, **options)[0][input_length:]
         metrics["output_tokens"] = len(generated)
@@ -197,17 +226,20 @@ def save_json(path, value):
 
 @timed_pipeline("extracting_json")
 def format_json(Qtokenizer=None, Qmodel=None, system_prompt=None, *, cleaned_text,
-                output_path=None, generate=None):
-    from .model_config import Qconfig
-    from .prompt import EXTRACT_SYSTEM_PROMPT
+                output_path=None, generate=None, layout_text=None):
+    from .model_config import Qconfig, EXTRACTION_CONFIG
+    from .prompt import EXTRACT_SYSTEM_PROMPT, LAYOUT_INPUT_PROMPT
     from .schema import validate_invoice
 
     if not cleaned_text.strip():
         raise ValueError("Extracted text is empty")
     generate = generate or make_generator(Qtokenizer, Qmodel)
+    use_layout = EXTRACTION_CONFIG["layout_aware"] and bool(layout_text)
     messages = [
-        {"role": "system", "content": system_prompt or EXTRACT_SYSTEM_PROMPT},
-        {"role": "user", "content": "OCR Text:\n\n" + cleaned_text},
+        {"role": "system", "content": (system_prompt or EXTRACT_SYSTEM_PROMPT)
+         + ("\n\n" + LAYOUT_INPUT_PROMPT if use_layout else "")},
+        {"role": "user", "content": "OCR Text:\n\n" + cleaned_text
+         + ("\n\nLayout-aware OCR (JSON):\n" + layout_text if use_layout else "")},
     ]
     for attempt in range(2):
         response = generate(messages, **Qconfig)

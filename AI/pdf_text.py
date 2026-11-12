@@ -1,9 +1,9 @@
 """Conservative per-page native text selection before OCR fallback."""
-from .ocr import page_text
+from .ocr import page_text, text_blocks
 from .performance import timed_stage
 
 
-def extract_pdf_pages(pdf, lock, min_chars=40):
+def extract_pdf_pages(pdf, lock, min_chars=40, *, layout_pages=None):
     """Return usable text or None per page, preserving document order.
 
     A large image can contain invoice rows absent from a native text header.
@@ -37,13 +37,21 @@ def extract_pdf_pages(pdf, lock, min_chars=40):
                             usable = False
                             break
                 native = None
+                result = None
                 if usable:
                     try:
-                        native = page_text({"rec_texts": [word[4] for word in words],
-                                            "rec_boxes": [word[:4] for word in words]})
+                        # Native words are unrotated; use displayed page coordinates.
+                        boxes = [list(pymupdf.Rect(word[:4]) * page.rotation_matrix) for word in words]
+                        result = {"rec_texts": [word[4] for word in words], "rec_boxes": boxes}
+                        native = page_text(result)
                     except RuntimeError:
                         # Malformed native text geometry should trigger OCR.
                         pass
                 metrics.update(source="pdf_text" if native else "ocr_required", characters=len(native or ""))
                 pages.append(native)
+                if layout_pages is not None:
+                    layout_pages.append({"page_number": index + 1,
+                                         "width": float(page.rect.width), "height": float(page.rect.height),
+                                         "coordinate_unit": "pdf_points", "source": "pdf_text",
+                                         "blocks": text_blocks(result) if native else []})
     return pages

@@ -30,7 +30,7 @@ flowchart TD
 
 1. **Extract text first, then OCR.** PyMuPDF reads native PDF words and groups them by bounding boxes. A page uses native text when it has at least 40 non-whitespace characters, four words, sufficient alphanumeric content, no replacement/control characters, no extraction warnings, and less than 10% image area. Otherwise the whole page falls back to OCR so a native header cannot hide a scanned invoice body. This is a conservative heuristic; it cannot prove the text layer matches the visible invoice. Only fallback pages are rendered at `OCR_DPI` (default 250), and Paddle models are loaded only if a page needs OCR. PaddleOCR uses exactly `PP-OCRv5_mobile_det` for detection and `en_PP-OCRv5_mobile_rec` for English recognition. Document orientation, unwarping, and text-line orientation models are disabled. Bounding boxes are grouped into rows, with cells ordered left to right and separated by tabs. Pages retain PDF order with `<PAGE>` separators in `detailed_invoice_output.txt`. Empty pages and malformed results fail explicitly to avoid returning partial invoices. Temporary page images are removed on success and failure. This is geometric text ordering, not table structure recognition; rotated text and complex merged tables need accuracy checks.
    Extraction also saves `extracted_text.txt` in the output directory: only the extracted text, with blank lines between pages, without HTML escaping or `<PAGE>` markers. This file is available before JSON extraction or tariff classification runs.
-2. **Use extracted text directly.** Qwen receives `extracted_text.txt` unchanged. There is no markup stripping, entity decoding, or whitespace cleanup step. Empty extracted text stops the run.
+2. **Use plain text and spatial evidence.** Qwen receives `extracted_text.txt` unchanged plus `layout_aware_text.txt` by default. Layout input contains page dimensions, units, original recognition order, text, bounding boxes and optional confidence. There is no markup stripping, entity decoding, or whitespace cleanup step. Empty extracted text stops the run.
 3. **Extract.** Qwen receives the text and the shared JSON Schema. It extracts invoice, shipment, and line-item fields without inferring tariff codes. Missing values are null. Manufacturing country must come from product evidence; it is not copied from the sender's address.
 4. **Validate extraction.** Missing invoice data fields are filled with null before validation, including fields in omitted order and shipment objects. Malformed JSON, unexpected fields, incorrect supplied field types, empty invoice lists, and empty item lists stop the run. Valid extraction is saved before classification modifies it.
 5. **Retrieve missing codes.** Country-specific codes explicitly printed on the invoice take precedence. Items with both structurally valid national codes skip retrieval and classification; if every item is complete, the tariff backend is never opened or downloaded. For incomplete items, Weaviate queries only countries whose codes are missing or malformed. Records use `(invoice_index, item_index)`, so SKU collisions cannot overwrite another item's results. Country lookup uses exact names, ISO codes, and explicit aliases.
@@ -130,6 +130,28 @@ PY
 
 Paddle uses `gpu:0` device syntax, while PyTorch/Qwen uses `cuda:0`. `PADDLE_ENV_CONFIG` sets `FLAGS_allocator_strategy=auto_growth` before Paddle imports to allocate GPU memory as needed. Explicit environment values take precedence. Restart the API after changing settings or framework packages. See the [official Paddle installation guide](https://www.paddlepaddle.org.cn/en/install/quick) for other CUDA/Python combinations.
 
+## Layout aware extraction
+
+`LAYOUT_AWARE_EXTRACTION=true` (default) supplies both plain text and compact layout JSON to the existing Qwen extraction model. Set it to `false` before starting the server for the previous plain-text-only model input. The switch is `EXTRACTION_CONFIG["layout_aware"]` in `model_config.py`; it does not change or reload the OCR model. Layout artifacts are saved in either mode.
+
+`document_layout.json` is the readable layout artifact; `layout_aware_text.txt` contains the same data as compact JSON for model input. Each page has a one-based page number, width, height, source, coordinate unit and blocks. OCR dimensions come from the actual rendered image and boxes use pixels. Native PDF pages use PDF points, transformed to displayed page coordinates when rotated. Coordinates start at the top left, with x increasing right and y increasing down. Blocks retain the original source array order as zero-based `reading_order`; plain text keeps the existing geometric row ordering. Confidence is null for native text or when OCR does not supply it.
+
+The extraction prompt explains horizontal alignment, vertical proximity, multi-column tables and page boundaries. No country, template or coordinate thresholds are added for associating invoice fields. Unicode is retained without translation. Recognition language coverage still depends on the configured OCR recognizer, which is English by default. Tests use fake recognition/model responses to verify data preservation and prompt delivery; they do not establish multilingual recognition or Qwen association accuracy.
+
+Both representations consume context tokens. Existing context and truncation checks still apply; large invoices may require splitting. Layout files follow the existing output retention policy, including removal after successful queued result delivery.
+
+Example model user input (illustrative page dimensions and boxes):
+
+```text
+OCR Text:
+
+Description\tQty
+Cable\t2
+
+Layout-aware OCR (JSON):
+{"coordinate_system":"top_left_origin_x_right_y_down","pages":[{"page_number":1,"width":600,"height":800,"coordinate_unit":"pixels","source":"ocr","blocks":[{"reading_order":0,"text":"Description","bbox":[20,20,150,40],"confidence":0.99},{"reading_order":1,"text":"Qty","bbox":[300,20,340,40],"confidence":0.98},{"reading_order":2,"text":"Cable","bbox":[20,60,100,80],"confidence":0.97},{"reading_order":3,"text":"2","bbox":[300,60,320,80],"confidence":0.99}]}]}
+```
+
 ## Model configuration
 
 Edit all model names and inference settings in [`model_config.py`](model_config.py).
@@ -143,13 +165,14 @@ and `Oconfig` imports remain compatible through aliases.
 | `MODEL_REVISIONS` | Optional revision pins for `ocr_det`, `ocr_rec`, and `qwen`; defaults to `None` |
 | `MODEL_CACHE_CONFIG` | Default cache base, vendor directory, and hub directory |
 | `OCR_CONFIG` | Paddle device, rendering DPI, recognition batch size, and native PDF text routing |
+| `EXTRACTION_CONFIG` | Include layout evidence alongside plain text in Qwen extraction input |
 | `PADDLE_ENV_CONFIG` | Paddle runtime environment defaults, including GPU memory growth |
 | `OCR_PIPELINE_CONFIG` | Optional orientation and unwarping models; all disabled by default |
 | `QWEN_RUNTIME_CONFIG` | GPU device, compute dtype, and accepted context budget |
 | `QWEN_QUANTIZATION_CONFIG` | Optional 4-bit NF4 and double quantization settings; disabled when `load_in_4bit=False` |
 | `QWEN_LOAD_CONFIG` | SDPA attention and low-memory model loading |
 | `QWEN_CHAT_TEMPLATE_CONFIG` | Chat formatting and thinking mode; thinking is disabled |
-| `QWEN_GENERATION_CONFIG` | Invoice extraction output budget: 15,000 tokens, temperature 0.0 |
+| `QWEN_GENERATION_CONFIG` | Invoice extraction output budget: 10,000 tokens, temperature 0.0 |
 | `GENERATION_DEFAULTS` | Direct generator defaults: 8,000 tokens, temperature 0.0 |
 | `PRODUCT_GENERATION_CONFIG` | Product identification budget: 1,000 tokens, temperature 0.0 |
 | `TARIFF_GENERATION_CONFIG` | Per-item classification budget: 700 tokens, temperature 0.0 |
@@ -188,7 +211,18 @@ still explicitly loads both OCR and Qwen for callers that want to preload them.
 | `QWEN_DEVICE` | `cuda:0` | GPU for all Qwen weights |
 | `QWEN_COMPUTE_DTYPE` | `bfloat16` | `auto`, `bfloat16`, `float16`, or `float32` compute dtype |
 | `QWEN_MAX_CONTEXT_TOKENS` | `32768` | Prompt plus output budget cap, bounded by model context |
-| `QWEN_MAX_NEW_TOKENS` | `15000` | Extraction output ceiling; reaching it fails rather than returning truncated JSON |
+| `QWEN_MAX_NEW_TOKENS` | `10000` | Requested extraction output ceiling, reduced to fit remaining context |
+| `QWEN_MIN_OUTPUT_TOKENS` | `2048` | Minimum remaining output capacity required after the safety margin |
+
+Before generation, available output capacity is `context_limit - input_tokens - 512`.
+The effective output ceiling is the smaller of the configured budget and available
+capacity. Inputs with less than `QWEN_MIN_OUTPUT_TOKENS` remaining capacity fail
+with an instruction to split or reduce the document. OCR text and layout metadata
+are never truncated to fit. Short product and tariff generation budgets remain
+unchanged when sufficient context is available. Budget logs include input tokens,
+configured and effective output tokens, context limit, and the safety margin.
+Reaching the effective output ceiling without an end token still fails to avoid
+returning truncated JSON.
 
 The context cap bounds accepted sequence lengths; it is not a hard GPU memory
 quota. Lower it for tighter memory budgets, keeping it larger than the prompt
@@ -313,6 +347,8 @@ Every output directory contains these files after a successful run:
 | --- | --- |
 | `detailed_invoice_output.txt` | Raw model-returned OCR |
 | `extracted_text.txt` | Extracted text supplied unchanged to Qwen |
+| `document_layout.json` | Page dimensions, text, source order, boxes and optional confidence |
+| `layout_aware_text.txt` | Compact layout JSON supplied alongside plain text when layout-aware extraction is enabled |
 | `extracted_invoice.json` | Schema-validated extraction before classification |
 | `db_matches.json` | Retrieved candidates, countries, source, and positional item identity |
 | `final_classification.json` | All invoices with classification results and review flags |
