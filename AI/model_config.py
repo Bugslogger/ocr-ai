@@ -27,7 +27,7 @@ QWEN_RUNTIME_CONFIG = {
     "compute_dtype": os.getenv("QWEN_COMPUTE_DTYPE", "bfloat16"),
     "max_context_tokens": int(os.getenv("QWEN_MAX_CONTEXT_TOKENS", "32768")),
     "min_output_tokens": int(os.getenv("QWEN_MIN_OUTPUT_TOKENS", "2048")),
-    "context_safety_margin": 512,
+    "context_safety_margin": 2048,
 }
 OCR_CONFIG = {
     "dpi": int(os.getenv("OCR_DPI", "250")),

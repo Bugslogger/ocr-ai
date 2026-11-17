@@ -33,8 +33,8 @@ flowchart TD
 1. **Extract text first, then OCR.** PyMuPDF reads native PDF words and groups them by bounding boxes. A page uses native text when it has at least 40 non-whitespace characters, four words, sufficient alphanumeric content, no replacement/control characters, no extraction warnings, and less than 10% image area. Otherwise the whole page falls back to OCR so a native header cannot hide a scanned invoice body. This is a conservative heuristic; it cannot prove the text layer matches the visible invoice. Only fallback pages are rendered at `OCR_DPI` (default 250), and Paddle models are loaded only if a page needs OCR. PaddleOCR uses exactly `PP-OCRv5_mobile_det` for detection and `en_PP-OCRv5_mobile_rec` for English recognition. Document orientation, unwarping, and text-line orientation models are disabled. Bounding boxes are grouped into rows, with cells ordered left to right and separated by tabs. Pages retain PDF order with `<PAGE>` separators in `detailed_invoice_output.txt`. Empty pages and malformed results fail explicitly to avoid returning partial invoices. Temporary page images are removed on success and failure. This is geometric text ordering, not table structure recognition; rotated text and complex merged tables need accuracy checks.
    Extraction also saves `extracted_text.txt` in the output directory: only the extracted text, with blank lines between pages, without HTML escaping or `<PAGE>` markers. This file is available before JSON extraction or tariff classification runs.
 2. **Use plain text and spatial evidence.** Qwen receives `extracted_text.txt` unchanged plus `layout_aware_text.txt` by default. Layout input contains page dimensions, units, original recognition order, text, bounding boxes and optional confidence. There is no markup stripping, entity decoding, or whitespace cleanup step. Empty extracted text stops the run.
-3. **Extract.** Qwen receives the text and the shared JSON Schema. It extracts invoice, shipment, and line-item fields without inferring tariff codes. Missing values are null. Manufacturing country must come from product evidence; it is not copied from the sender's address.
-4. **Validate extraction.** Missing invoice data fields are filled with null before validation, including fields in omitted order and shipment objects. Malformed JSON, unexpected fields, incorrect supplied field types, empty invoice lists, and empty item lists stop the run. Valid extraction is saved before classification modifies it.
+3. **Analyze and extract.** In the same extraction request, Qwen is instructed to analyze invoice boundaries, party blocks, tables, column labels, units, and value scope before mapping data into the shared JSON Schema. No fixed input template or field list is assumed. Standard fields support the tariff pipeline; unfamiliar printed fields are preserved in optional `additional_fields` arrays inside `order_level`, `shipment`, or each item. Each entry has `label`, `value` (printed text with units), `source_text`, and `page_number` (null without layout evidence). For example, an item's `Net wt (kg)` column remains item evidence rather than becoming an invoice weight or monetary value. Missing standard values are null. Manufacturing country must come from product evidence; it is not copied from the sender's address.
+4. **Validate extraction.** Missing invoice data fields are filled with null before validation, including fields in omitted order and shipment objects. Malformed JSON and schema-invalid responses (including unexpected fields or incorrect types) trigger one regeneration from the complete current source with path-specific validation feedback. A second invalid response stops the run; both raw responses are saved for inspection. Empty invoice lists and final empty item lists remain invalid. Valid extraction is saved before classification modifies it.
 5. **Retrieve missing codes.** Country-specific codes explicitly printed on the invoice take precedence. Items with both structurally valid national codes skip retrieval and classification; if every item is complete, the tariff backend is never opened or downloaded. For incomplete items in Weaviate mode, Qwen first selects HS6 from the shared catalog. Weaviate then queries only that HS6 prefix in countries whose codes are missing or malformed. Records use `(invoice_index, item_index)`, so SKU collisions cannot overwrite another item's results. Country lookup uses exact names, ISO codes, and explicit aliases.
 6. **Select and validate.** Qwen may choose only retrieved HS6 values. Each national code must occur in the corresponding country's candidate list and extend the chosen HS6. Invalid selections are rejected before formatting. An item's classification failure becomes a reviewable result; processing continues for other items.
 7. **Persist.** Each item receives classification fields, evidence, and review status. The complete result is written to `final_classification.json` and returned to the caller.
@@ -139,11 +139,11 @@ Paddle uses `gpu:0` device syntax, while PyTorch/Qwen uses `cuda:0`. `PADDLE_ENV
 
 `document_layout.json` is the readable layout artifact; `layout_aware_text.txt` contains the same data as compact JSON for model input. Each page has a one-based page number, width, height, source, coordinate unit and blocks. OCR dimensions come from the actual rendered image and boxes use pixels. Native PDF pages use PDF points, transformed to displayed page coordinates when rotated. Coordinates start at the top left, with x increasing right and y increasing down. Blocks retain the original source array order as zero-based `reading_order`; plain text keeps the existing geometric row ordering. Confidence is null for native text or when OCR does not supply it.
 
-Before model inference, `AI/layout_input.py` losslessly compacts supported layout JSON when that shortens the representation. Page-local `x_coordinates` and `y_coordinates` tables hold exact original numeric values, and each block becomes `[reading_order, text, x1_index, y1_index, x2_index, y2_index, confidence]`. The model prompt explains how to resolve indices to coordinates before interpreting geometry. No coordinates are rounded, no blocks or text are removed, and the original layout artifacts remain unchanged. Unknown layout shapes or block metadata are passed through unchanged. The `preparing_layout_input` timing logs original and model character counts; Qwen budget logs report the actual token count. Documents that still cannot fit retain the explicit split-or-reduce error rather than losing content.
+Before model inference, `AI/layout_input.py` losslessly compacts supported layout JSON when that shortens the representation. Page-local `x_coordinates` and `y_coordinates` tables hold exact original numeric values, and each block becomes `[reading_order, text, x1_index, y1_index, x2_index, y2_index, confidence]`. The model prompt explains how to resolve indices to coordinates before interpreting geometry. No coordinates are rounded, no blocks or text are removed, and the original layout artifacts remain unchanged. Unknown layout shapes or block metadata are passed through unchanged. The `preparing_layout_input` timing logs original and model character counts; Qwen budget logs report the actual token count. Documents that still cannot fit are automatically extracted in smaller page or row chunks, preserving their source evidence.
 
 The extraction prompt explains horizontal alignment, vertical proximity, multi-column tables and page boundaries. No country, template or coordinate thresholds are added for associating invoice fields. Unicode is retained without translation. Recognition language coverage still depends on the configured OCR recognizer, which is English by default. Tests use fake recognition/model responses to verify data preservation and prompt delivery; they do not establish multilingual recognition or Qwen association accuracy.
 
-Both representations consume context tokens. Existing context and truncation checks still apply; large invoices may require splitting. Layout files follow the existing output retention policy, including removal after successful queued result delivery.
+Both representations consume context tokens. Context and truncation checks still apply to every request, including automatically split chunks. Layout files follow the existing output retention policy, including removal after successful queued result delivery.
 
 Example model user input (illustrative page dimensions and boxes):
 
@@ -221,13 +221,42 @@ still explicitly loads both OCR and Qwen for callers that want to preload them.
 
 Before generation, available output capacity is `context_limit - input_tokens - 512`.
 The effective output ceiling is the smaller of the configured budget and available
-capacity. Inputs with less than `QWEN_MIN_OUTPUT_TOKENS` remaining capacity fail
-with an instruction to split or reduce the document. OCR text and layout metadata
-are never truncated to fit. Short product and tariff generation budgets remain
+capacity. Invoice extraction additionally counts the actual chat-template tokens
+on CPU before inference and reserves the full configured extraction output budget.
+If the document does not fit, extraction splits consecutive pages recursively.
+An oversized single page is split between geometric text rows, keeping columns
+together and preserving original page numbers, coordinates, confidence and text.
+Source layout must reconstruct the complete plain text exactly before splitting;
+custom callers with mismatched/missing layout receive an explicit error.
+OCR text and layout metadata are never truncated to fit. Short product and tariff generation budgets remain
 unchanged when sufficient context is available. Budget logs include input tokens,
 configured and effective output tokens, context limit, and the safety margin.
-Reaching the effective output ceiling without an end token still fails to avoid
-returning truncated JSON.
+Reaching the effective output ceiling without an end token triggers smaller
+extraction chunks; other generation callers still receive an explicit error.
+Each chunk's prompt and validator share the same schema, including an internal
+continuation flag and empty item lists for header/totals-only fragments. Schema
+violations receive the same single source-based retry as malformed JSON. Fields
+are never silently stripped, remapped, or coerced to make a response validate.
+If a chunk still fails validation after that retry, extraction splits its source
+again and regenerates the smaller chunks. Failed parent responses are retained
+for diagnostics and never merged. An indivisible row that fails both attempts
+raises the original validation error; no partial final invoice is saved.
+`gross_weight`/`net_weight` are supported as standard properties only for invoice-wide
+order fields; per-item weights are preserved in that item's `additional_fields`.
+Extra fields retain printed labels, values, source excerpts and original page numbers.
+Continuation merging appends extra-field occurrences without deduplication, including
+repeated labels on separate pages. Per-item weights must not be promoted to totals
+or renamed to monetary `gross_value`. The last invoice's
+metadata (without its items) is supplied as reference for continuation decisions.
+Only explicitly indicated continuations are combined; conflicting metadata fails
+instead of selecting an arbitrary value. Item arrays are appended in source order,
+without SKU deduplication. Unknown/new invoice identities remain separate.
+The merged document must pass the original schema before it is saved or classified.
+An indivisible row that still exceeds the budget fails explicitly. Chunking does
+not recover from CUDA out-of-memory errors or other unrelated inference failures.
+Chunk outputs are saved under `extraction_chunks/` for inspection and follow the
+existing output retention policy. Timing logs include `extraction_context_budget`
+and `extracting_invoice_chunk`. No API payload changes are required.
 
 The context cap bounds accepted sequence lengths; it is not a hard GPU memory
 quota. Lower it for tighter memory budgets, keeping it larger than the prompt
@@ -437,7 +466,7 @@ python -m unittest discover -s AI/tests -v
 
 Tests use local generated PDFs and fake model/database responses. They cover country matching, national-prefix rejection, absent overlays, preserved invoice evidence, multiple invoices, duplicate/missing SKUs, temporary-file cleanup, context budgets, truncation detection, and imports without model/network side effects. Synthetic national codes in test fixtures test validation mechanics, not tariff correctness.
 
-A real GPU smoke test should process a known invoice and compare every extracted item, quantity, amount, country, and code with the source PDF. Schema validation verifies structure, not whether OCR or Qwen captured every line. The pipeline does not reconcile financial totals, split oversized documents automatically, prove tariff applicability from legal notes, or calibrate model confidence. Context overflow and output-token exhaustion fail explicitly rather than silently accepting truncated JSON. Short or ambiguous descriptions can still retrieve poor candidates; such results need review even when candidate membership passes.
+A real GPU smoke test should process a known invoice and compare every extracted item, quantity, amount, country, and code with the source PDF. Schema validation verifies structure, not whether OCR or Qwen captured every line. The pipeline does not reconcile financial totals, prove tariff applicability from legal notes, or calibrate model confidence. Oversized documents and exhausted extraction outputs trigger automatic chunking. Indivisible oversized rows and conflicting continuations fail explicitly. Cross-chunk invoice association and table interpretation remain model decisions and require accuracy checks on real documents. Row boundaries are geometric; wrapped item descriptions and table headers spanning chunks especially need source comparison. Short or ambiguous descriptions can still retrieve poor candidates; such results need review even when candidate membership passes.
 
 ## Standalone product identification
 

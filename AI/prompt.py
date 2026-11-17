@@ -2,9 +2,38 @@
 import json
 from .schema import INVOICE_SCHEMA
 
-system_prompt = """You are an expert data extraction and product tariff classification assistant.
+_EXTRACTION_INSTRUCTIONS = """You are an expert invoice document analysis and data extraction assistant.
 
 Your task is to convert the provided OCR text into the required structured JSON format.
+
+DOCUMENT ANALYSIS BEFORE FIELD MAPPING:
+No invoice template, language, column order, or set of printed fields is known in
+advance. Analyze the current source before generating JSON: identify invoice
+boundaries, seller/buyer/delivery blocks, tables, full column labels, row membership,
+units, declarations and totals. Determine whether each value belongs to the whole
+invoice, shipment, or one particular item using labels and spatial evidence.
+Map a source field to a standard property only when its meaning and scope match;
+the output schema is an integration contract, not a list of what a PDF may contain.
+Do not assume the first number is a quantity or the last number is a price. Do not
+copy values across rows or infer missing totals, units, countries or identities.
+Keep this analysis internal; return the extracted data, not a reasoning transcript.
+
+UNFAMILIAR FIELDS:
+Preserve every evidenced field that has no matching standard property in the
+additional_fields array of its own order_level, shipment, or item_level object.
+Each entry contains the original printed label, value as printed (including units,
+currency, punctuation and original language), a verbatim source_text excerpt, and
+the original page_number from layout, or null when no page number is available.
+Keep repeated occurrences as separate entries. For table cells, use their actual
+column header as label and the cell text as source_text. Never invent an English
+label, a missing value, or source evidence. If scope is unclear, preserve the
+labeled field at order_level rather than attaching it to an arbitrary item.
+Do not add arbitrary property names outside additional_fields. Omit this array or
+return [] when there are no extra fields. Standard nullable fields remain null
+when absent; never force unfamiliar data into an unrelated standard field.
+Example: an item column "Net wt (kg)" with cell "2.50" is preserved on that item as
+{"label":"Net wt (kg)","value":"2.50","source_text":"2.50","page_number":1}
+inside additional_fields. It is not an invoice-wide net_weight or monetary value.
 
 COUNTRY EXTRACTION — INDEPENDENT EVIDENCE FOR EACH ROLE:
 Resolve country roles before returning invoice fields. In any language or format,
@@ -152,17 +181,9 @@ For US imports:
 - Do not fabricate the final 10-digit HTSUS suffix.
 - If only a 4-digit HS heading is printed, preserve those four digits; never invent a 6-digit or national extension.
 
-CONFIDENCE:
-Return a confidence value for tariff classification:
-- HIGH: Explicit tariff code found in authoritative source or classification is strongly supported by an official ruling.
-- MEDIUM: Classification is strongly supported by product characteristics but the exact tariff provision requires verification.
-- LOW: Insufficient information or competing classifications exist.
-
-EVIDENCE:
-When classification is inferred rather than explicitly provided, include:
-- classification_reason
-- source/evidence used, if available
-- confidence
+Tariff inference, classification confidence and classification reasons belong to
+the later classification stage. Do not generate them during document extraction
+or place model conclusions in additional_fields; that array holds printed data only.
 
 HALLUCINATION PREVENTION:
 Never create a tariff code merely to fill a field.
@@ -176,8 +197,23 @@ JSON syntax rules:
 - Use the literal null for missing values; never leave a value blank after a colon or use None, undefined, NaN, or Infinity.
 - Numeric fields must contain a JSON number or null. Example: printed "1,234.50 GBP" becomes 1234.50. Never output currency symbols, thousands separators, units, or arithmetic expressions in numeric values.
 - Use double quotes for keys and string values, escape quotes and newlines inside strings, and do not include comments or trailing commas.
+FIELD PLACEMENT:
+- Use only properties listed in the schema at their specified object level.
+- gross_weight and net_weight belong only to order_level and only when the source
+  gives invoice-wide weights. They are not item_level properties. Do not promote
+  a per-item weight into an invoice total, rename weight to gross_value (a monetary
+  field), or invent a total to fit the schema. Preserve item weights and other
+  unfamiliar fields in that item's additional_fields with their printed labels.
 JSON Schema:
-""" + json.dumps(INVOICE_SCHEMA)
+"""
+
+
+def extraction_prompt(schema=None):
+    """Render instructions against the exact schema used for this request."""
+    return _EXTRACTION_INSTRUCTIONS + json.dumps(INVOICE_SCHEMA if schema is None else schema)
+
+
+system_prompt = extraction_prompt()
 
 EXTRACT_SYSTEM_PROMPT = system_prompt
 

@@ -48,8 +48,8 @@ Bounding boxes are grouped into rows with cells ordered left to right and separa
 
 ## Extraction and tariff safeguards
 
-- Missing invoice data fields are filled with `null`; unexpected fields, incorrect types, empty invoice lists and empty item lists are rejected.
-- Qwen context budgets are checked before generation. Output reaching the token limit is rejected when it appears truncated.
+- Missing invoice data fields are filled with `null`. Malformed JSON and schema-invalid responses receive one regeneration from the complete current source with path-specific feedback; a second invalid response fails explicitly, with both raw responses saved. Chunk prompts and validators share the same schema. Unexpected fields are never silently removed or remapped; item weights must not become invoice totals or monetary values. Empty invoice lists and final empty item lists remain invalid.
+- Extraction preflights actual chat-template token counts on CPU and reserves its full output budget. Oversized documents split recursively at page boundaries, then at geometric row boundaries for oversized pages. Output exhaustion also triggers splitting; text and geometry are never truncated. Chunk continuations use prior invoice metadata without prior items; conflicting metadata fails explicitly, duplicate SKUs remain separate item occurrences, and the combined result passes the original schema before classification. Per-chunk outputs are retained under `extraction_chunks/` until normal artifact cleanup.
 - Manufacturing country, export country, shipper country and destination country are represented separately.
 - Inferred HS6 must belong to retrieved candidates. National selections must belong to the respective country candidates and extend the selected HS6.
 - Printed invoice tariff codes are retained as evidence and require review. Structurally valid printed national codes take precedence over inferred values.
@@ -121,7 +121,7 @@ Artifact retention depends on entry point. CLI runs save outputs in a run direct
 
 # Implementation gaps and documentation differences
 
-- **Layout-aware setting is unused.** `EXTRACTION_CONFIG["layout_aware"]` is declared in AI/model_config.py but is not consumed by the current pipeline.
+- **Layout-aware extraction is active.** `EXTRACTION_CONFIG["layout_aware"]` controls whether Qwen receives compact spatial evidence alongside the unchanged plain text. Automatic chunking also uses the original layout to establish safe source boundaries when spatial model input is disabled.
 - **No dedicated table or document-layout model.** Layout handling currently consists of bounding-box ordering.
 - **Orientation and unwarping are disabled.** Document orientation classification, document unwarping and text-line orientation models are switched off.
 - **No embedding retrieval or reranking stage.** Retrieval uses keyword scoring, BM25 and code-prefix expansion.
@@ -132,7 +132,7 @@ Artifact retention depends on entry point. CLI runs save outputs in a run direct
 
 # Verification status
 
-Both existing test suites were attempted. The environment lacked dependencies including fastapi, pymupdf and pycountry, preventing successful completion. The AI test run reported 75 tests with 42 errors; server test discovery reported six module import errors.
+Both test suites pass using the repository virtual environment: 149 AI tests and 76 server tests. A CPU-only check with the cached real Qwen tokenizer reproduced the saved 57,644-token input and accepted five smaller fragments of its single page; every original block and coordinate was represented exactly once. That check used simulated inference responses. Automatic-chunking regression tests cover the reported 57,644-token input, output reservation, recursive page and row splitting, exact evidence coverage, repeated SKUs, header-only fragments, independent invoices, conflicting continuations, disabled spatial input, and indivisible-row failures. These checks do not establish model extraction accuracy.
 
-The implementation findings are based on source inspection. Live GPU inference, end-to-end extraction accuracy and production latency were not established. No repository code was changed.
+Live GPU inference on the failing PDF, end-to-end extraction accuracy and production latency have not been established. Chunk continuation and item interpretation remain model decisions; regression tests use controlled responses. The context-overflow fix changes `AI/utils.py` and adds `AI/extraction_chunks.py` with dedicated tests.
 

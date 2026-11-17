@@ -70,6 +70,28 @@ INVOICE_SCHEMA = object_schema({
     })},
 })
 
+# Optional extensions preserve arbitrary printed labels without weakening types
+# or allowing model-created keys to collide with downstream classification fields.
+ADDITIONAL_FIELDS_SCHEMA = {
+    "type": "array",
+    "description": "Source fields without a matching standard property at this scope. Preserve repeated occurrences and printed values including units.",
+    "items": {
+        "type": "object",
+        "properties": {
+            "label": {"type": "string", "minLength": 1},
+            "value": {"type": "string", "minLength": 1},
+            "source_text": {"type": "string", "minLength": 1},
+            "page_number": {"type": ["integer", "null"], "minimum": 1},
+        },
+        "required": ["label", "value", "source_text", "page_number"],
+        "additionalProperties": False,
+    },
+}
+_properties = INVOICE_SCHEMA["properties"]["invoices"]["items"]["properties"]
+for _scope in (_properties["order_level"], _properties["shipment"],
+               _properties["item_level"]["items"]):
+    _scope["properties"]["additional_fields"] = ADDITIONAL_FIELDS_SCHEMA
+
 # Describe existing fields without changing the API's required keys or types.
 _invoice_properties = INVOICE_SCHEMA["properties"]["invoices"]["items"]["properties"]
 for _group in (_invoice_properties["order_level"]["properties"],
@@ -98,14 +120,19 @@ def _fill_missing_fields(value, schema):
     return value
 
 
-def validate_invoice(value):
+def validate_invoice_schema(value, schema):
+    """Validate any extraction contract with a compact, path-specific error."""
     from jsonschema import Draft202012Validator
 
-    value = _fill_missing_fields(value, INVOICE_SCHEMA)
-    errors = sorted(Draft202012Validator(INVOICE_SCHEMA).iter_errors(value),
+    value = _fill_missing_fields(value, schema)
+    errors = sorted(Draft202012Validator(schema).iter_errors(value),
                     key=lambda e: str(list(e.absolute_path)))
     if errors:
         error = errors[0]
         location = ".".join(map(str, error.absolute_path)) or "root"
         raise ValueError(f"Invalid invoice JSON at {location}: {error.message}")
     return value
+
+
+def validate_invoice(value):
+    return validate_invoice_schema(value, INVOICE_SCHEMA)

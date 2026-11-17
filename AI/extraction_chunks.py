@@ -1,0 +1,175 @@
+"""Bounded invoice extraction preserving page/row evidence and item multiplicity."""
+from copy import deepcopy
+import json
+from pathlib import Path
+
+from .ocr import page_text
+from .schema import INVOICE_SCHEMA, validate_invoice, validate_invoice_schema
+from .performance import timed_stage
+
+CHUNK_PROMPT = """DOCUMENT CHUNK OVERRIDE:
+This request contains a disjoint, consecutive portion of a larger document. Extract
+only items in the current OCR text/layout, never items from previous metadata.
+A chunk may contain only headers, declarations or totals: return item_level [] for
+that invoice (this overrides the schema's item minimum for this request only).
+Add required boolean continues_previous to EACH invoice object (the only extra
+field allowed). Set true only for the FIRST invoice when evidence identifies it
+as a continuation of the previous invoice supplied below, such as matching invoice
+identity or an uninterrupted item table with no new invoice header. Set false for
+new invoices; never attach a different issuer or invoice number to the previous one.
+If a headerless item table cannot be associated confidently, do not invent invoice
+identity: set false and keep unknown metadata null. Preserve every item occurrence,
+including identical rows and missing/duplicate SKUs. Previous metadata is reference
+for identifying continuation only; extract metadata only from the current source.
+Do not repeat prior metadata in your response. Table fragments retain original page
+numbers and coordinates. Do not treat a partial page as the end of the invoice.
+"""
+
+
+def chunk_schema():
+    """One contract shared by chunk prompts and response validation."""
+    schema = deepcopy(INVOICE_SCHEMA)
+    invoice = schema["properties"]["invoices"]["items"]
+    invoice["properties"]["continues_previous"] = {"type": "boolean"}
+    invoice["required"].append("continues_previous")
+    invoice["properties"]["item_level"]["minItems"] = 0
+    return schema
+
+
+def validate_chunk(value):
+    value = validate_invoice_schema(value, chunk_schema())
+    if any(invoice["continues_previous"] for invoice in value["invoices"][1:]):
+        raise ValueError("Only the first invoice in a chunk may continue the previous chunk")
+    return value
+
+
+def _text(page):
+    return page_text({"rec_texts": [b["text"] for b in page["blocks"]],
+                      "rec_boxes": [b["bbox"] for b in page["blocks"]]})
+
+
+def _split(pages):
+    if len(pages) > 1:
+        middle = len(pages) // 2
+        return pages[:middle], pages[middle:]
+    page = pages[0]
+    # Use the same geometric row membership as plain-text generation. A cut never
+    # separates the quantity/price columns from the description in that row.
+    rows = []
+    empty = []
+    for block in sorted(page["blocks"], key=lambda b: (
+            (b["bbox"][1] + b["bbox"][3]) / 2, b["bbox"][0])):
+        if not block["text"].strip():
+            empty.append(block)
+            continue
+        _, y1, _, y2 = block["bbox"]
+        center, height = (y1 + y2) / 2, y2 - y1
+        row = next((r for r in reversed(rows)
+                    if abs(center - r[0]) <= .5 * min(height, r[1])), None)
+        if row is None:
+            rows.append((center, height, [block]))
+        else:
+            row[2].append(block)
+    if len(rows) < 2:
+        raise ValueError(
+            "A single invoice text row exceeds the model input/output budget. "
+            "Cannot split it safely; provide a PDF with smaller text blocks or "
+            "configure a supported larger context/output budget. No source was truncated."
+        )
+    left_ids = {id(b) for row in rows[:len(rows) // 2] for b in row[2]}
+    left_ids.update(id(b) for b in empty)
+    left = [b for b in page["blocks"] if id(b) in left_ids]
+    right = [b for b in page["blocks"] if id(b) not in left_ids]
+    return [{**page, "blocks": left}], [{**page, "blocks": right}]
+
+
+def _merge(invoices, fragment):
+    continuation = fragment.pop("continues_previous")
+    if not continuation:
+        invoices.append(fragment)
+        return
+    if not invoices:
+        raise ValueError("First extraction chunk cannot continue a previous invoice")
+    previous = invoices[-1]
+    # Identity may occur in either metadata object; reject cross-object conflicts.
+    for field in ("invoice_number", "invoice_date", "currency"):
+        values = [obj[group].get(field) for obj in (previous, fragment)
+                  for group in ("order_level", "shipment") if obj[group].get(field) is not None]
+        if len({str(v).strip().casefold() for v in values}) > 1:
+            raise ValueError(f"Conflicting {field} across invoice continuation chunks; manual review required")
+    for group in ("order_level", "shipment"):
+        for key, value in fragment[group].items():
+            if key == "additional_fields":
+                # These are source occurrences, not competing scalar totals.
+                previous[group].setdefault(key, []).extend(value)
+                continue
+            old = previous[group].get(key)
+            if value is not None and old is not None and value != old:
+                # Whitespace/case variations are safe; conflicting totals or
+                # parties are not resolved by selecting an arbitrary chunk.
+                if not (isinstance(value, str) and isinstance(old, str)
+                        and " ".join(value.split()).casefold() == " ".join(old.split()).casefold()):
+                    raise ValueError(f"Conflicting {group}.{key} across invoice continuation chunks; manual review required")
+            if old is None:
+                previous[group][key] = value
+    previous["item_level"].extend(fragment["item_level"])
+
+
+def extract_in_chunks(cleaned_text, layout_text, generate, system_prompt=None, output_path=None):
+    from .utils import (_format_json_single, ContextBudgetError, OutputTokenLimitError,
+                        InvalidInvoiceResponseError, apply_receiver_name_policy, save_json)
+
+    try:
+        layout = json.loads(layout_text)
+        pages = layout["pages"]
+        # Only split when the spatial evidence exactly reconstructs the source.
+        # Unknown input shapes must not silently lose text or metadata.
+        if not pages or "\n\n".join(_text(page) for page in pages) != cleaned_text:
+            raise ValueError("Layout pages do not reconstruct the complete extracted text")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ValueError(
+            "Oversized extraction requires matching original page layout to split safely. "
+            "Re-extract the PDF through doc_pipeline; no input was truncated."
+        ) from exc
+    invoices = []
+    chunk_number = 0
+
+    def process(batch):
+        nonlocal chunk_number
+        chunk_number += 1
+        chunk_dir = Path(output_path) / "extraction_chunks" / str(chunk_number) if output_path else None
+        context = {key: invoices[-1][key] for key in ("order_level", "shipment")} if invoices else {}
+        text = "\n\n".join(_text(page) for page in batch)
+        spatial = json.dumps({**layout, "pages": batch}, ensure_ascii=False, separators=(",", ":"))
+        try:
+            with timed_stage("extracting_invoice_chunk", chunk=chunk_number,
+                             first_page=batch[0]["page_number"], last_page=batch[-1]["page_number"]):
+                result = _format_json_single(cleaned_text=text, layout_text=spatial,
+                                             system_prompt=system_prompt, generate=generate,
+                                             output_path=chunk_dir, chunk_context=context)
+        except (ContextBudgetError, OutputTokenLimitError):
+            left, right = _split(batch)
+            process(left)
+            process(right)
+            return
+        except InvalidInvoiceResponseError as error:
+            # A smaller source can recover persistent model schema/syntax errors.
+            # Keep the failed responses as diagnostics; merge only validated children.
+            # At an indivisible row preserve the validation error, not a budget error.
+            try:
+                left, right = _split(batch)
+            except ValueError:
+                raise error from error.__cause__
+            process(left)
+            process(right)
+            return
+        if chunk_dir:
+            save_json(chunk_dir / "extracted_chunk.json", result)
+        for fragment in result["invoices"]:
+            _merge(invoices, fragment)
+
+    # The unchunked request already failed preflight or exhausted generation.
+    left, right = _split(pages)
+    process(left)
+    process(right)
+    return apply_receiver_name_policy(validate_invoice({"invoices": invoices}))

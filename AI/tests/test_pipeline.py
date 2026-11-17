@@ -850,7 +850,7 @@ class PipelineTests(TestCase):
         generate = Mock(return_value='{"invoices":[]}')
         with self.assertRaisesRegex(ValueError, "Invalid invoice JSON"):
             format_json(cleaned_text="Invoice", generate=generate)
-        generate.assert_called_once()
+        self.assertEqual(generate.call_count, 2)
 
     def test_invalid_json_regenerates_complete_invoice_and_keeps_diagnostics(self):
         payload = {"invoices": [invoice("FIRST"), invoice("SECOND")]}
