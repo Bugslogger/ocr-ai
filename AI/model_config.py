@@ -25,8 +25,9 @@ QWEN_GENERATION_CONFIG = {
 QWEN_RUNTIME_CONFIG = {
     "device": os.getenv("QWEN_DEVICE", "cuda:0"),
     "compute_dtype": os.getenv("QWEN_COMPUTE_DTYPE", "bfloat16"),
-    "max_context_tokens": int(os.getenv("QWEN_MAX_CONTEXT_TOKENS", "32768")),
-    "min_output_tokens": int(os.getenv("QWEN_MIN_OUTPUT_TOKENS", "2048")),
+    # 80,000 input tokens + 10,000 output tokens + 2,048 safety tokens.
+    "max_context_tokens": int(os.getenv("QWEN_MAX_CONTEXT_TOKENS", "92048")),
+    "min_output_tokens": int(os.getenv("QWEN_MIN_OUTPUT_TOKENS", "4096")),
     "context_safety_margin": 2048,
 }
 OCR_CONFIG = {

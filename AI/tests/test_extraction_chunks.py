@@ -121,6 +121,49 @@ class ChunkExtractionTests(TestCase):
         self.assertEqual(inv["order_level"]["currency"], "USD")
         self.assertEqual(len(inv["item_level"]), 1)
 
+    def test_unassociated_metadata_is_preserved_without_creating_empty_invoice(self):
+        from server.schemas import InvoiceExtractionResponse
+        plain, layout = document(pages=4)
+        first = fragment(items=[{"sku_code": "DUP"}] * 2, total_amount=100)
+        second = fragment(items=[{"sku_code": "DUP"}] * 2, total_amount=500)
+        footer = fragment(items=[], total_amount=500)
+        generate = Mock(side_effect=[ContextBudgetError("split"), json.dumps(first),
+                                    ContextBudgetError("split again"), json.dumps(second), json.dumps(footer)])
+        with TemporaryDirectory() as folder:
+            result = format_json(cleaned_text=plain, layout_text=layout, generate=generate, output_path=folder)
+            self.assertEqual(json.loads((Path(folder) / "extracted_invoice.json").read_text()), result)
+        self.assertEqual(len(result["invoices"]), 2)
+        self.assertEqual(sum(len(inv["item_level"]) for inv in result["invoices"]), 4)
+        self.assertEqual([inv["order_level"]["total_amount"] for inv in result["invoices"]], [100, 500])
+        metadata = result["metadata_only_fragments"][0]
+        self.assertEqual(metadata["order_level"]["total_amount"], 500)
+        self.assertEqual(metadata["source_chunks"], [4])
+        self.assertEqual(metadata["source_pages"], [4])
+        self.assertEqual(len(result["extraction_warnings"]), 2)
+        # Both API serialization and persisted-job reload retain the diagnostics.
+        api = InvoiceExtractionResponse.model_validate(result).model_dump(mode="json")
+        self.assertEqual(api, result)
+        self.assertEqual(InvoiceExtractionResponse.model_validate_json(json.dumps(api)).model_dump(), result)
+
+    def test_header_for_a_different_invoice_is_not_attached_to_previous_items(self):
+        plain, layout = document(pages=2)
+        generate = Mock(side_effect=[ContextBudgetError("split"), json.dumps(fragment(number="A")),
+                                    json.dumps(fragment(number="B", items=[], total_amount=900))])
+        result = format_json(cleaned_text=plain, layout_text=layout, generate=generate)
+        self.assertEqual(result["invoices"][0]["order_level"]["invoice_number"], "A")
+        self.assertIsNone(result["invoices"][0]["order_level"]["total_amount"])
+        self.assertEqual(result["metadata_only_fragments"][0]["order_level"]["invoice_number"], "B")
+
+    def test_all_metadata_and_no_items_still_fails_without_saving_final(self):
+        plain, layout = document(pages=2)
+        generate = Mock(side_effect=[ContextBudgetError("split"), json.dumps(fragment(items=[])),
+                                    json.dumps(fragment(number="OTHER", items=[]))])
+        with TemporaryDirectory() as folder:
+            with self.assertRaisesRegex(ValueError, "No invoice line items.*manual review"):
+                format_json(cleaned_text=plain, layout_text=layout, generate=generate, output_path=folder)
+            self.assertFalse((Path(folder) / "extracted_invoice.json").exists())
+            self.assertEqual(len(list(Path(folder).glob("extraction_chunks/*/extracted_chunk.json"))), 2)
+
     def test_new_invoices_and_unknown_identities_remain_separate(self):
         for second in ("INV-2", None):
             with self.subTest(second=second):

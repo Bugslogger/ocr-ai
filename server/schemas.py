@@ -63,8 +63,19 @@ class ExtractedInvoice(BaseModel):
     shipment: dict[str, Any]
 
 
+class MetadataOnlyFragment(BaseModel):
+    order_level: dict[str, Any]
+    shipment: dict[str, Any]
+    source_chunks: list[int] = Field(min_length=1)
+    source_pages: list[int] = Field(min_length=1)
+    reason: str
+
+
 class InvoiceExtractionResponse(BaseModel):
     invoices: list[ExtractedInvoice] = Field(min_length=1)
+    metadata_only_fragments: list[MetadataOnlyFragment] = Field(
+        default_factory=list, exclude_if=lambda value: not value)
+    extraction_warnings: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
 
 
 class InvoiceJobResponse(BaseModel):

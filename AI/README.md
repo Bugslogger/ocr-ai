@@ -215,11 +215,11 @@ still explicitly loads both OCR and Qwen for callers that want to preload them.
 | `OCR_RECOGNITION_BATCH_SIZE` | `32` | Text recognition crop batch size |
 | `QWEN_DEVICE` | `cuda:0` | GPU for all Qwen weights |
 | `QWEN_COMPUTE_DTYPE` | `bfloat16` | `auto`, `bfloat16`, `float16`, or `float32` compute dtype |
-| `QWEN_MAX_CONTEXT_TOKENS` | `32768` | Prompt plus output budget cap, bounded by model context |
+| `QWEN_MAX_CONTEXT_TOKENS` | `92048` | Prompt plus output budget cap, bounded by model context; defaults allow 80,000 input tokens with the default output reserve and safety margin |
 | `QWEN_MAX_NEW_TOKENS` | `10000` | Requested extraction output ceiling, reduced to fit remaining context |
-| `QWEN_MIN_OUTPUT_TOKENS` | `2048` | Minimum remaining output capacity required after the safety margin |
+| `QWEN_MIN_OUTPUT_TOKENS` | `4096` | Minimum remaining output capacity required after the safety margin |
 
-Before generation, available output capacity is `context_limit - input_tokens - 512`.
+Before generation, available output capacity is `context_limit - input_tokens - 2048`.
 The effective output ceiling is the smaller of the configured budget and available
 capacity. Invoice extraction additionally counts the actual chat-template tokens
 on CPU before inference and reserves the full configured extraction output budget.
@@ -252,6 +252,14 @@ Only explicitly indicated continuations are combined; conflicting metadata fails
 instead of selecting an arbitrary value. Item arrays are appended in source order,
 without SKU deduplication. Unknown/new invoice identities remain separate.
 The merged document must pass the original schema before it is saved or classified.
+An unassociated metadata-only fragment is retained in top-level
+`metadata_only_fragments` with its order/shipment data, source chunk numbers,
+page numbers and review reason. It is not emitted as an invoice with an empty
+item list or silently assigned to another invoice. `extraction_warnings` flags
+these fragments and repeated invoice numbers across separate item-bearing outputs.
+The API and saved job results retain these diagnostics; callers should review them
+before using invoice totals. If no chunk yields any items, extraction still fails
+explicitly and retains source/chunk artifacts for inspection.
 An indivisible row that still exceeds the budget fails explicitly. Chunking does
 not recover from CUDA out-of-memory errors or other unrelated inference failures.
 Chunk outputs are saved under `extraction_chunks/` for inspection and follow the

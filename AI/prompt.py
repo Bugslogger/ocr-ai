@@ -210,7 +210,10 @@ JSON Schema:
 
 def extraction_prompt(schema=None):
     """Render instructions against the exact schema used for this request."""
-    return _EXTRACTION_INSTRUCTIONS + json.dumps(INVOICE_SCHEMA if schema is None else schema)
+    schema = INVOICE_SCHEMA if schema is None else schema
+    schema = {**schema, "properties": {key: value for key, value in schema["properties"].items()
+                                      if key not in ("metadata_only_fragments", "extraction_warnings")}}
+    return _EXTRACTION_INSTRUCTIONS + json.dumps(schema)
 
 
 system_prompt = extraction_prompt()

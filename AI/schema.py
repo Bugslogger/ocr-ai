@@ -92,6 +92,23 @@ for _scope in (_properties["order_level"], _properties["shipment"],
                _properties["item_level"]["items"]):
     _scope["properties"]["additional_fields"] = ADDITIONAL_FIELDS_SCHEMA
 
+# Pipeline-generated diagnostics, optional for existing extraction callers. These
+# preserve unassociated source evidence without pretending it is an item invoice.
+INVOICE_SCHEMA["properties"]["metadata_only_fragments"] = {
+    "type": "array", "items": object_schema({
+        "order_level": _properties["order_level"],
+        "shipment": _properties["shipment"],
+        "source_chunks": {"type": "array", "minItems": 1,
+                          "items": {"type": "integer", "minimum": 1}},
+        "source_pages": {"type": "array", "minItems": 1,
+                         "items": {"type": "integer", "minimum": 1}},
+        "reason": {"type": "string", "minLength": 1},
+    }),
+}
+INVOICE_SCHEMA["properties"]["extraction_warnings"] = {
+    "type": "array", "items": {"type": "string", "minLength": 1},
+}
+
 # Describe existing fields without changing the API's required keys or types.
 _invoice_properties = INVOICE_SCHEMA["properties"]["invoices"]["items"]["properties"]
 for _group in (_invoice_properties["order_level"]["properties"],
